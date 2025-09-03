@@ -7,11 +7,10 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "node-fetch": "^3.3.2",
     "form-data": "^4.0.0",
-    "multer": "^1.4.5-lts.1",
-    "node-fetch": "^3.3.2"
+    "ffmpeg-static": "^5.2.0",
+    "fluent-ffmpeg": "^2.1.2"
   }
 }
