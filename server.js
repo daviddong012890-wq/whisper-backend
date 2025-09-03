@@ -1,61 +1,88 @@
 import express from "express";
-import multer from "multer";
 import fetch from "node-fetch";
 import FormData from "form-data";
-import cors from "cors";
-import dotenv from "dotenv";
-import fs from "fs";
-
-dotenv.config();
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegStatic from "ffmpeg-static";
+import { Readable } from "stream";
 
 const app = express();
-app.use(cors());
+app.use(express.json({ limit: "2mb" }));
 
-const upload = multer({ dest: "uploads/" });
-const PORT = process.env.PORT || 10000;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // set in Render Dashboard
+if (!OPENAI_API_KEY) {
+  console.error("Missing OPENAI_API_KEY env var");
+  process.exit(1);
+}
 
-app.get("/", (req, res) => {
-  res.send("Whisper backend is running.");
-});
+ffmpeg.setFfmpegPath(ffmpegStatic);
 
-app.post("/transcribe", upload.single("file"), async (req, res) => {
+function bufferToStream(buf) {
+  const stream = new Readable();
+  stream.push(buf);
+  stream.push(null);
+  return stream;
+}
+
+async function downloadToBuffer(fileUrl) {
+  const res = await fetch(fileUrl);
+  if (!res.ok) {
+    throw new Error(`Download failed ${res.status}: ${await res.text()}`);
+  }
+  const arrayBuf = await res.arrayBuffer();
+  return Buffer.from(arrayBuf);
+}
+
+async function toMp3Buffer(inputBuffer) {
+  return new Promise((resolve, reject) => {
+    const inputStream = bufferToStream(inputBuffer);
+    const chunks = [];
+    ffmpeg(inputStream)
+      .outputFormat("mp3")
+      .audioCodec("libmp3lame")
+      .on("error", reject)
+      .on("end", () => resolve(Buffer.concat(chunks)))
+      .pipe()
+      .on("data", (c) => chunks.push(c));
+  });
+}
+
+async function whisperTranscribe(mp3Buffer, responseFormat = "srt") {
+  const fd = new FormData();
+  fd.append("file", mp3Buffer, { filename: "audio.mp3", contentType: "audio/mpeg" });
+  fd.append("model", "whisper-1");
+  fd.append("response_format", responseFormat);
+
+  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      ...fd.getHeaders()
+    },
+    body: fd
+  });
+
+  if (!res.ok) {
+    throw new Error(`OpenAI error ${res.status}: ${await res.text()}`);
+  }
+  return await res.text(); // srt or plain text
+}
+
+// POST /transcribe_by_url  { url, response_format: "srt"|"text" }
+app.post("/transcribe_by_url", async (req, res) => {
   try {
-    if (!req.file) {
-      return res
-        .status(400)
-        .json({ error: 'No file uploaded. Form field name must be "file".' });
-    }
+    const { url, response_format = "srt" } = req.body || {};
+    if (!url) return res.status(400).json({ error: "Missing url" });
 
-    const form = new FormData();
-    form.append("file", fs.createReadStream(req.file.path), {
-      filename: req.file.originalname,
-      contentType: req.file.mimetype,
-    });
-    form.append("model", "whisper-1");
-    form.append("response_format", "srt");
-
-    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: form,
-    });
-
-    if (!r.ok) {
-      const errText = await r.text();
-      res.status(r.status).type("text/plain").send(errText);
-      return;
-    }
-
-    const srtText = await r.text();
-    res.type("text/plain").send(srtText);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error during transcription." });
+    const raw = await downloadToBuffer(url);     // video or audio
+    const mp3 = await toMp3Buffer(raw);          // shrink to MP3
+    const out = await whisperTranscribe(mp3, response_format);
+    res.type("text/plain").send(out);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e) });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
-});
+app.get("/", (_, res) => res.send("OK"));
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Server on ${PORT}`));
