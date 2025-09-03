@@ -2,6 +2,7 @@ import express from "express";
 import multer from "multer";
 import fetch from "node-fetch";
 import fs from "fs";
+import FormData from "form-data";   // ✅ added this line
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
@@ -11,18 +12,18 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
   try {
     const fileStream = fs.createReadStream(req.file.path);
 
+    // build form-data for Whisper
+    const formData = new FormData();
+    formData.append("file", fileStream);
+    formData.append("model", "whisper-1");
+    formData.append("response_format", "srt");
+
     const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       },
-      body: (() => {
-        const formData = new FormData();
-        formData.append("file", fileStream);
-        formData.append("model", "whisper-1");
-        formData.append("response_format", "srt"); // subtitle format
-        return formData;
-      })(),
+      body: formData,
     });
 
     const srtText = await response.text();
