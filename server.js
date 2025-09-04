@@ -39,26 +39,38 @@ try {
   console.log("🔑 Key path:", GOOGLE_KEYFILE);
 } catch (e) { fatal("Bad service-account JSON: " + e.message); }
 
-// Google Sheets client
+// ===== SAFE LOGGING =====
+function logAxiosError(prefix, err) {
+  const status = err?.response?.status;
+  const code   = err?.code;
+  // Prefer a human message from server, else generic message
+  const msg = err?.response?.data?.error?.message
+          || err?.message
+          || String(err);
+  console.error(`${prefix}${status ? " ["+status+"]" : ""}${code ? " ("+code+")" : ""}: ${msg}`);
+  // 🔒 DO NOT log err.config / err.request / err.response.headers — they may contain secrets
+}
+
+// ===== GOOGLE CLIENTS =====
 const auth = new google.auth.GoogleAuth({
   keyFile: GOOGLE_KEYFILE,
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
 const sheets = google.sheets({ version: "v4", auth });
 
-// Gmail SMTP
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: { user: GMAIL_USER, pass: GMAIL_PASS },
 });
 
-// In-memory cumulative minutes (sheet is the durable ledger)
+// In-memory cumulative minutes (sheet is durable history)
 let cumulativeMinutes = 0;
 
 // ===== Helpers =====
 function statBytes(p){
   try { return fs.statSync(p).size; } catch { return 0; }
 }
+
 function getAudioMinutes(filePath){
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, meta) => {
@@ -94,69 +106,83 @@ async function toMp3Filtered(inPath, kbps){
 }
 
 // Prepare audio for Whisper: try 64k → 48k → 32k → 24k until <= 25 MB
-const OPENAI_AUDIO_MAX = 25 * 1024 * 1024; // ~25 MB
+const OPENAI_AUDIO_MAX = 25 * 1024 * 1024; // ~25 MB (Audio API limit). See OpenAI Audio API FAQ. 
+// https://help.openai.com/... “The maximum file size for the Audio API is 25MB.” 
+// (Reference: OpenAI Help Center) 
 async function prepareAudioForWhisper(inPath){
   const ladder = [64, 48, 32, 24]; // kbps
   for (const kbps of ladder) {
     const out = await toMp3Filtered(inPath, kbps);
     const sz = statBytes(out);
     if (sz <= OPENAI_AUDIO_MAX) return { path: out, kbps, bytes: sz };
-    // too big, try next lower bitrate and delete this bigger file
     try { fs.unlinkSync(out); } catch {}
   }
-  // If even 24 kbps is > 25 MB (very long audio), just return 24k version anyway.
+  // If still >25MB, keep 24k anyway (for very long inputs)
   const out = await toMp3Filtered(inPath, 24);
   return { path: out, kbps: 24, bytes: statBytes(out) };
 }
 
-// Whisper (verbose JSON -> language)
+// ===== OpenAI calls (with safe logging) =====
 async function whisperTranscribeVerbose(audioPath){
-  const fd = new FormData();
-  fd.append("file", fs.createReadStream(audioPath), { filename: path.basename(audioPath) });
-  fd.append("model", "whisper-1");
-  fd.append("response_format", "verbose_json");
-  fd.append("temperature", "0");
+  try {
+    const fd = new FormData();
+    fd.append("file", fs.createReadStream(audioPath), { filename: path.basename(audioPath) });
+    fd.append("model", "whisper-1");
+    fd.append("response_format", "verbose_json");
+    fd.append("temperature", "0");
 
-  const r = await axios.post("https://api.openai.com/v1/audio/transcriptions", fd, {
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
-    maxBodyLength: Infinity,
-  });
-  return r.data; // { text, language, ... }
+    const r = await axios.post("https://api.openai.com/v1/audio/transcriptions", fd, {
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
+      maxBodyLength: Infinity,
+    });
+    return r.data; // { text, language, ... }
+  } catch (err) {
+    logAxiosError("❌ Whisper transcribe failed", err);
+    throw new Error("Transcription failed");
+  }
 }
 
-// Whisper translate -> English
 async function whisperTranslateToEnglish(audioPath){
-  const fd = new FormData();
-  fd.append("file", fs.createReadStream(audioPath), { filename: path.basename(audioPath) });
-  fd.append("model", "whisper-1");
-  fd.append("translate", "true");
-  fd.append("temperature", "0");
+  try {
+    const fd = new FormData();
+    fd.append("file", fs.createReadStream(audioPath), { filename: path.basename(audioPath) });
+    fd.append("model", "whisper-1");
+    fd.append("translate", "true");
+    fd.append("temperature", "0");
 
-  const r = await axios.post("https://api.openai.com/v1/audio/translations", fd, {
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
-    maxBodyLength: Infinity,
-  });
-  return r.data; // { text }
+    const r = await axios.post("https://api.openai.com/v1/audio/translations", fd, {
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
+      maxBodyLength: Infinity,
+    });
+    return r.data; // { text }
+  } catch (err) {
+    logAxiosError("❌ Whisper translate→EN failed", err);
+    throw new Error("English translation failed");
+  }
 }
 
-// GPT: EN -> Traditional Chinese
 async function toTraditionalChinese(text){
-  const r = await axios.post(
-    "https://api.openai.com/v1/chat/completions",
-    {
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "你是專業翻譯，請將使用者的英文內容翻譯為自然、精準、正式的繁體中文（保留專有名詞）。不得添加任何評論或說明。" },
-        { role: "user", content: text || "" }
-      ],
-      temperature: 0.2
-    },
-    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
-  );
-  return r.data?.choices?.[0]?.message?.content?.trim() || "";
+  try {
+    const r = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "你是專業翻譯，請將使用者的英文內容翻譯為自然、精準、正式的繁體中文（保留專有名詞）。不得添加任何評論或說明。" },
+          { role: "user", content: text || "" }
+        ],
+        temperature: 0.2
+      },
+      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+    );
+    return r.data?.choices?.[0]?.message?.content?.trim() || "";
+  } catch (err) {
+    logAxiosError("❌ GPT EN→繁中 failed", err);
+    throw new Error("Traditional Chinese translation failed");
+  }
 }
 
-// Ensure sheet header
+// ===== Sheets header =====
 const HEADER = [
   "Timestamp","Email","Minutes","CumulativeMinutes","FileName","FileSizeMB",
   "Language","RequestId","ProcessingMs","Succeeded","ErrorMessage","Model","FileType"
@@ -194,7 +220,6 @@ async function processJob({ email, inputPath, fileMeta, requestId }) {
   let fileName = fileMeta.originalname || "upload";
   let fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size || 0)/(1024*1024))*100)/100);
 
-  // Transcode to MP3 with adaptive bitrate ≤ 25 MB
   let audio = null;
   try {
     audio = await prepareAudioForWhisper(inputPath);
@@ -204,11 +229,9 @@ async function processJob({ email, inputPath, fileMeta, requestId }) {
   }
 
   try {
-    // Use the final compressed file for duration
     minutes = await getAudioMinutes(audio?.path || inputPath);
     cumulativeMinutes += minutes;
 
-    // Transcribe & translate
     const verbose = await whisperTranscribeVerbose(audio?.path || inputPath);
     language = verbose.language || "";
     const originalText = verbose.text || "";
@@ -244,8 +267,9 @@ ${originalText}
     succeeded = true;
 
   } catch (err) {
-    errorMessage = err?.response?.data?.error?.message || err?.message || String(err);
-    console.error("❌ Error processing upload (requestId " + requestId + "):", err);
+    // Only a short, redacted message hits logs
+    errorMessage = err?.message || "Processing error";
+    console.error("❌ Error processing upload:", errorMessage);
   }
 
   // Append analytics row
@@ -280,7 +304,6 @@ ${originalText}
   try { fs.unlinkSync(inputPath); } catch {}
   try {
     if (audio?.path && fs.existsSync(audio.path)) fs.unlinkSync(audio.path);
-    // also remove any intermediate encodes we may have left
     ["64k","48k","32k","24k"].forEach(k => {
       const p = inputPath + "." + k + ".mp3";
       if (fs.existsSync(p)) try { fs.unlinkSync(p); } catch {}
@@ -300,11 +323,11 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     setImmediate(() =>
       processJob({ email, inputPath: req.file.path, fileMeta: req.file, requestId })
-        .catch(e => console.error("Background job failed:", e))
+        .catch(e => console.error("Background job failed:", e?.message || e))
     );
 
   } catch (err) {
-    console.error("❌ Error accepting upload:", err);
+    console.error("❌ Error accepting upload:", err?.message || err);
     res.status(500).json({ error: "Processing failed at accept stage" });
   }
 });
