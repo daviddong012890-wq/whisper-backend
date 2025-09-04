@@ -7,9 +7,16 @@ import fetch from "node-fetch";
 import FormData from "form-data";
 import nodemailer from "nodemailer";
 import { google } from "googleapis";
+import cors from "cors";
 
 const app = express();
-const upload = multer({ dest: "/tmp" }); // Render temporary storage
+
+// ✅ Allow cross-origin requests (so Google Site can call this API)
+app.use(cors({
+  origin: "*", // later you can lock this down to "https://dottlight.com"
+}));
+
+const upload = multer({ dest: "/tmp" }); // temp storage
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
 // ENV vars
