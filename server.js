@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import fs from "fs";
+import path from "path";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegStatic from "ffmpeg-static";
 import fetch from "node-fetch";
@@ -10,48 +11,65 @@ import nodemailer from "nodemailer";
 import { google } from "googleapis";
 
 const app = express();
-app.use(cors({ origin: "*" })); // you can lock to https://dottlight.com later
+app.use(cors({ origin: "*" })); // lock to https://dottlight.com later if you want
 const upload = multer({ dest: "/tmp" });
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
-// ==== ENV ====
+// ===== ENV =====
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const GMAIL_USER = process.env.GMAIL_USER;
-const GMAIL_PASS = process.env.GMAIL_PASS;
-const SHEET_ID   = process.env.SHEET_ID;
-if (!OPENAI_API_KEY || !GMAIL_USER || !GMAIL_PASS || !SHEET_ID) {
-  console.error("❌ Missing env vars (OPENAI_API_KEY, GMAIL_USER, GMAIL_PASS, SHEET_ID)");
-  process.exit(1);
+const GMAIL_USER     = process.env.GMAIL_USER;
+const GMAIL_PASS     = process.env.GMAIL_PASS;
+const SHEET_ID       = process.env.SHEET_ID;
+const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS; // e.g. /etc/secrets/gcp-sa.json
+
+function fatal(msg) { console.error("❌ " + msg); process.exit(1); }
+
+if (!OPENAI_API_KEY) fatal("Missing OPENAI_API_KEY");
+if (!GMAIL_USER || !GMAIL_PASS) fatal("Missing GMAIL_USER or GMAIL_PASS");
+if (!SHEET_ID) fatal("Missing SHEET_ID");
+if (!GOOGLE_KEYFILE) fatal("Missing GOOGLE_APPLICATION_CREDENTIALS (path to your service-account JSON)");
+
+// ===== Verify key file exists & show the service-account email =====
+if (!fs.existsSync(GOOGLE_KEYFILE)) {
+  fatal(`Service-account key file not found at ${GOOGLE_KEYFILE}. Did you add it as a Secret File on Render and set GOOGLE_APPLICATION_CREDENTIALS to /etc/secrets/gcp-sa.json?`);
+}
+let SA_EMAIL = "";
+try {
+  const raw = fs.readFileSync(GOOGLE_KEYFILE, "utf8");
+  const j = JSON.parse(raw);
+  SA_EMAIL = j.client_email || "";
+  console.log("🔑 Using service account:", SA_EMAIL);
+  console.log("🔑 Key path:", GOOGLE_KEYFILE);
+} catch (e) {
+  fatal("Could not read/parse service-account JSON: " + e.message);
 }
 
-// ==== Google Sheets ====
+// ===== Google Sheets (explicitly point to the key file) =====
 const auth = new google.auth.GoogleAuth({
+  keyFile: GOOGLE_KEYFILE,
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-  // With GOOGLE_APPLICATION_CREDENTIALS set, googleapis will auto-load the key.
 });
 const sheets = google.sheets({ version: "v4", auth });
 
-// ==== Email ====
+// ===== Email (Gmail SMTP) =====
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: { user: GMAIL_USER, pass: GMAIL_PASS },
 });
 
-// cumulative minutes (resets when Render instance restarts; the Sheet keeps history)
+// ===== Helpers =====
 let cumulativeMinutes = 0;
 
-// helper: precise audio duration (minutes)
 function getAudioMinutes(filePath) {
   return new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(filePath, (err, metadata) => {
+    ffmpeg.ffprobe(filePath, (err, meta) => {
       if (err) return reject(err);
-      const sec = metadata.format?.duration || 0;
-      resolve(Math.max(1, Math.ceil(sec / 60))); // at least 1 minute
+      const seconds = meta?.format?.duration || 0;
+      resolve(Math.max(1, Math.ceil(seconds / 60)));
     });
   });
 }
 
-// helper: call Whisper transcription
 async function whisperTranscribe(mp3Path) {
   const fd = new FormData();
   fd.append("file", fs.createReadStream(mp3Path));
@@ -66,7 +84,6 @@ async function whisperTranscribe(mp3Path) {
   return j.text || "";
 }
 
-// helper: call Whisper translate→English
 async function whisperTranslateToEnglish(mp3Path) {
   const fd = new FormData();
   fd.append("file", fs.createReadStream(mp3Path));
@@ -82,7 +99,6 @@ async function whisperTranslateToEnglish(mp3Path) {
   return j.text || "";
 }
 
-// helper: GPT to produce Chinese translation from English (or from original if English)
 async function translateToChinese(text) {
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -94,7 +110,7 @@ async function translateToChinese(text) {
       model: "gpt-4o-mini",
       messages: [
         { role: "system", content: "You are a precise translator. Translate to clear, natural Simplified Chinese without adding commentary." },
-        { role: "user", content: text }
+        { role: "user", content: text || "" }
       ],
       temperature: 0.2
     }),
@@ -104,88 +120,15 @@ async function translateToChinese(text) {
   return j.choices?.[0]?.message?.content?.trim() || "";
 }
 
+// ===== Main upload endpoint =====
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
-    const email = req.body.email?.trim();
+    const email = (req.body.email || "").trim();
     if (!email) return res.status(400).json({ error: "Email is required" });
 
-    const inputPath = req.file.path;          // uploaded temp file
-    const mp3Path   = inputPath + ".mp3";     // extracted audio
+    const inputPath = req.file.path;
+    const mp3Path = inputPath + ".mp3";
 
-    // 1) Extract audio as MP3 (192 kbps stereo 44.1k)
+    // Extract audio to MP3
     await new Promise((resolve, reject) => {
-      ffmpeg(inputPath)
-        .outputOptions(["-vn", "-ar 44100", "-ac 2", "-b:a 192k"])
-        .save(mp3Path)
-        .on("end", resolve)
-        .on("error", reject);
-    });
-
-    // 2) Duration in minutes
-    const minutes = await getAudioMinutes(mp3Path);
-    cumulativeMinutes += minutes;
-
-    // 3) Whisper: original-language transcript + English translation
-    const [originalText, englishText] = await Promise.all([
-      whisperTranscribe(mp3Path),
-      whisperTranslateToEnglish(mp3Path),
-    ]);
-
-    // 4) Chinese translation (from English to guarantee clean CN)
-    const chineseText = await translateToChinese(englishText || originalText);
-
-    // 5) Log to Google Sheet (Date | Email | Minutes | Cumulative | Preview)
-    const nowIso = new Date().toISOString();
-    const preview = (englishText || originalText).slice(0, 120);
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: "Sheet1!A:E",
-      valueInputOption: "RAW",
-      requestBody: { values: [[nowIso, email, minutes, cumulativeMinutes, preview]] },
-    });
-
-    // 6) Email the user
-    const mailBody =
-`Your transcription is ready.
-
-— Minutes: ${minutes}
-— Cumulative minutes: ${cumulativeMinutes}
-
-== English ==
-${englishText || originalText}
-
-== Chinese (中文) ==
-${chineseText}
-
-== Original language ==
-${originalText}
-
-(Do not reply to this email. If you need help, contact support.)`;
-
-    await transporter.sendMail({
-      from: `"Transcription Service" <${GMAIL_USER}>`,
-      to: email,
-      subject: "Your Bilingual Transcription (EN & 中文)",
-      text: mailBody,
-    });
-
-    // 7) Cleanup
-    try { fs.unlinkSync(inputPath); } catch {}
-    try { fs.unlinkSync(mp3Path);   } catch {}
-
-    // 8) Response to the page
-    res.json({
-      success: true,
-      minutes,
-      cumulativeMinutes,
-      preview,
-    });
-  } catch (err) {
-    console.error("❌ Error processing upload:", err);
-    res.status(500).json({ error: "Processing failed" });
-  }
-});
-
-app.get("/", (_req, res) => res.send("✅ Whisper backend running"));
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
+      ffmpeg(inp
