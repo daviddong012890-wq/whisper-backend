@@ -23,6 +23,7 @@ const GMAIL_USER     = process.env.GMAIL_USER;
 const GMAIL_PASS     = process.env.GMAIL_PASS;
 const SHEET_ID       = process.env.SHEET_ID;
 const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+const LOCAL_TZ       = process.env.LOCAL_TZ || "America/Los_Angeles"; // <— set in Render
 
 function fatal(m){ console.error("❌ " + m); process.exit(1); }
 if (!OPENAI_API_KEY) fatal("Missing OPENAI_API_KEY");
@@ -30,10 +31,7 @@ if (!GMAIL_USER || !GMAIL_PASS) fatal("Missing GMAIL_USER or GMAIL_PASS");
 if (!SHEET_ID) fatal("Missing SHEET_ID");
 if (!GOOGLE_KEYFILE) fatal("Missing GOOGLE_APPLICATION_CREDENTIALS");
 if (!fs.existsSync(GOOGLE_KEYFILE)) fatal(`Key not found at ${GOOGLE_KEYFILE}`);
-
-// Optionally parse JSON only to validate the key file (we no longer show SA email)
-try { JSON.parse(fs.readFileSync(GOOGLE_KEYFILE,"utf8")); }
-catch(e){ fatal("Bad service-account JSON: " + e.message); }
+try { JSON.parse(fs.readFileSync(GOOGLE_KEYFILE,"utf8")); } catch(e){ fatal("Bad service-account JSON: " + e.message); }
 
 // ===== SAFE LOGGING =====
 function logAxiosError(prefix, err) {
@@ -55,8 +53,8 @@ const mailer = nodemailer.createTransport({
   auth: { user: GMAIL_USER, pass: GMAIL_PASS }
 });
 
-// ===== JOB TRACKING (simple status endpoint) =====
-const jobs = new Map(); // id -> { status, steps[], error, metrics{} }
+// ===== JOB TRACKING =====
+const jobs = new Map();
 function addStep(id, text){
   const cur = jobs.get(id) || { status:"queued", steps:[], error:null, metrics:{} };
   cur.steps.push({ at: new Date().toISOString(), text });
@@ -75,80 +73,23 @@ app.get("/status", (req,res)=>{
   res.json(j);
 });
 
-// ===== SHEET HEADER =====
-const HEADER = [
-  "Timestamp","Email","Minutes","CumulativeMinutes","FileName","FileSizeMB",
-  "Language","RequestId","ProcessingMs","Succeeded","ErrorMessage","Model","FileType"
-];
-async function ensureHeader(){
-  try {
-    const got = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
-      range: "Sheet1!A1:M1",
-    });
-    const cur = got.data.values?.[0] || [];
-    const ok = HEADER.length === cur.length && HEADER.every((h,i)=>h===cur[i]);
-    if (!ok) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SHEET_ID,
-        range: "Sheet1!A1:M1",
-        valueInputOption: "RAW",
-        requestBody: { values: [HEADER] }
-      });
-    }
-  } catch(e){ console.error("⚠️ ensureHeader:", e.message || e); }
-}
-
-// ===== PER-EMAIL CUMULATIVE (from durable history) =====
-async function getPastMinutesForEmail(email){
-  try {
-    const resp = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
-      range: "Sheet1!A2:J",
-      valueRenderOption: "UNFORMATTED_VALUE",
-    });
-    const rows = resp.data.values || [];
-    const target = (email||"").toLowerCase();
-    let sum = 0;
-    for (const r of rows){
-      const em = (r[1] || "").toLowerCase();
-      const succeeded = String(r[9] ?? "").toLowerCase() === "true";
-      if (em === target && succeeded){
-        const m = Number(r[2]);
-        if (!Number.isNaN(m)) sum += m;
-      }
-    }
-    return sum;
-  } catch (e) {
-    console.error("⚠️ getPastMinutesForEmail:", e.message || e);
-    return 0;
+// ===== TIME / FORMAT HELPERS =====
+function fmtLocalStamp(d){
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: LOCAL_TZ, year:"numeric", month:"short", day:"numeric",
+    hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:true
+  }).formatToParts(d);
+  let Y,M,D,hh,mm,ss,ap;
+  for (const p of parts){
+    if (p.type==="year") Y=p.value;
+    else if (p.type==="month") M=p.value;
+    else if (p.type==="day") D=p.value;
+    else if (p.type==="hour") hh=p.value;
+    else if (p.type==="minute") mm=p.value;
+    else if (p.type==="second") ss=p.value;
+    else if (p.type==="dayPeriod") ap=p.value.toUpperCase();
   }
-}
-
-// ===== AUDIO PIPELINE =====
-const OPENAI_AUDIO_MAX = 25 * 1024 * 1024; // ~25 MB hard API limit
-
-function statBytes(p){ try { return fs.statSync(p).size; } catch { return 0; } }
-
-// precise seconds for a single media file
-function getSeconds(filePath){
-  return new Promise((resolve, reject)=>{
-    ffmpeg.ffprobe(filePath, (err, meta)=>{
-      if (err) return reject(err);
-      const sec = Number(meta?.format?.duration) || 0;
-      resolve(sec);
-    });
-  });
-}
-// sum seconds over an array of paths; round to integer seconds
-async function sumSeconds(paths){
-  let total = 0;
-  for (const p of paths) total += await getSeconds(p);
-  return Math.round(total);
-}
-// minutes to write to sheet (ceil, min 1)
-function secsToSheetMinutes(sec){
-  return Math.max(1, Math.ceil((sec||0)/60));
+  return `${Y} ${M} ${D} ${hh}:${mm}:${ss} ${ap}`;
 }
 function fmtZhSec(sec){
   const s = Math.max(0, Math.round(sec||0));
@@ -156,101 +97,139 @@ function fmtZhSec(sec){
   const r = s % 60;
   return `${m} 分 ${r} 秒`;
 }
+function secsToSheetMinutes(sec){
+  return Math.max(1, Math.ceil((sec||0)/60));
+}
+
+// ===== SHEET HEADER (adds seconds + local time) =====
+const HEADER = [
+  "TimestampUTC","TimestampLocal","Email",
+  "Seconds","CumulativeSeconds",
+  "Minutes","CumulativeMinutes",
+  "FileName","FileSizeMB","Language","RequestId",
+  "ProcessingMs","Succeeded","ErrorMessage","Model","FileType"
+];
+
+async function ensureHeader(){
+  try {
+    const got = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: "Sheet1!A1:Q1",
+    });
+    const cur = got.data.values?.[0] || [];
+    const ok = HEADER.length === cur.length && HEADER.every((h,i)=>h===cur[i]);
+    if (!ok) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID,
+        range: "Sheet1!A1:Q1",
+        valueInputOption: "RAW",
+        requestBody: { values: [HEADER] }
+      });
+    }
+  } catch(e){ console.error("⚠️ ensureHeader:", e.message || e); }
+}
+
+// Sum prior SUCCESS rows for this email using Seconds if present, else fallback to Minutes*60
+async function getPastSecondsForEmail(email){
+  try {
+    const resp = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: "Sheet1!A2:Q",
+      valueRenderOption: "UNFORMATTED_VALUE",
+    });
+    const rows = resp.data.values || [];
+    const target = (email||"").toLowerCase();
+    let sec = 0;
+    for (const r of rows){
+      const em = (r[2] || "").toLowerCase();          // Email
+      const succeeded = String(r[12] ?? "").toLowerCase() === "true"; // Succeeded
+      if (em === target && succeeded){
+        const s = Number(r[3]);                        // Seconds
+        if (!Number.isNaN(s)) sec += s;
+        else {
+          const m = Number(r[5]);                      // Minutes fallback
+          if (!Number.isNaN(m)) sec += m*60;
+        }
+      }
+    }
+    return sec;
+  } catch (e) {
+    console.error("⚠️ getPastSecondsForEmail:", e.message || e);
+    return 0;
+  }
+}
+
+// ===== AUDIO PIPELINE =====
+const OPENAI_AUDIO_MAX = 25 * 1024 * 1024;
+
+function statBytes(p){ try { return fs.statSync(p).size; } catch { return 0; } }
+
+function getSecondsOne(filePath){
+  return new Promise((resolve, reject)=>{
+    ffmpeg.ffprobe(filePath, (err, meta)=>{
+      if (err) return reject(err);
+      resolve(Number(meta?.format?.duration) || 0);
+    });
+  });
+}
+async function sumSeconds(paths){
+  let t = 0;
+  for (const p of paths) t += await getSecondsOne(p);
+  return Math.round(t);
+}
 
 async function extractToWav(inPath, outPath){
   await new Promise((resolve, reject)=>{
-    ffmpeg(inPath)
-      .noVideo()
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(16000)
-      .format("wav")
-      .save(outPath)
-      .on("end", resolve)
-      .on("error", reject);
+    ffmpeg(inPath).noVideo()
+      .audioCodec("pcm_s16le").audioChannels(1).audioFrequency(16000)
+      .format("wav").save(outPath).on("end", resolve).on("error", reject);
   });
   return outPath;
 }
-
 async function wavToMp3Filtered(inWav, outMp3, kbps){
   await new Promise((resolve, reject)=>{
     ffmpeg(inWav)
-      .audioFilters([
-        "highpass=f=200",
-        "lowpass=f=3800",
-        "dynaudnorm"
-      ])
-      .outputOptions([
-        "-vn",
-        "-ac", "1",
-        "-ar", "16000",
-        "-b:a", `${kbps}k`,
-        "-codec:a", "libmp3lame"
-      ])
-      .save(outMp3)
-      .on("end", resolve)
-      .on("error", reject);
+      .audioFilters(["highpass=f=200","lowpass=f=3800","dynaudnorm"])
+      .outputOptions(["-vn","-ac","1","-ar","16000","-b:a",`${kbps}k`,"-codec:a","libmp3lame"])
+      .save(outMp3).on("end", resolve).on("error", reject);
   });
   return outMp3;
 }
-
-// Try 64 → 48 → 32 → 24 kbps until ≤ 25 MB
 async function prepareMp3UnderLimit(inMediaPath, requestId){
   const tmpWav = inMediaPath + ".clean.wav";
   addStep(requestId, "Extracting audio → WAV …");
   await extractToWav(inMediaPath, tmpWav);
 
-  const ladder = [64, 48, 32, 24]; // kbps
+  const ladder = [64,48,32,24];
   for (const kb of ladder){
-    const candidate = inMediaPath + `.${kb}k.mp3`;
+    const out = inMediaPath + `.${kb}k.mp3`;
     addStep(requestId, `Encode MP3 ${kb} kbps …`);
-    await wavToMp3Filtered(tmpWav, candidate, kb);
-    const sz = statBytes(candidate);
+    await wavToMp3Filtered(tmpWav, out, kb);
+    const sz = statBytes(out);
     addStep(requestId, `MP3 ${kb} kbps = ${(sz/1024/1024).toFixed(2)} MB`);
-    if (sz <= OPENAI_AUDIO_MAX) {
-      try { fs.unlinkSync(tmpWav); } catch {}
-      return { path: candidate, kbps: kb, bytes: sz };
-    }
-    try { fs.unlinkSync(candidate); } catch {}
+    if (sz <= OPENAI_AUDIO_MAX){ try{fs.unlinkSync(tmpWav);}catch{} return { path: out, kbps: kb, bytes: sz }; }
+    try{ fs.unlinkSync(out);}catch{}
   }
   const fallback = inMediaPath + `.24k.mp3`;
   await wavToMp3Filtered(tmpWav, fallback, 24);
-  try { fs.unlinkSync(tmpWav); } catch {}
-  return { path: fallback, kbps: 24, bytes: statBytes(fallback) };
+  try{ fs.unlinkSync(tmpWav);}catch{}
+  return { path:fallback, kbps:24, bytes: statBytes(fallback) };
 }
-
 async function splitIfNeeded(mp3Path, requestId){
-  const size = statBytes(mp3Path);
-  if (size <= OPENAI_AUDIO_MAX) return [mp3Path];
-
+  if (statBytes(mp3Path) <= OPENAI_AUDIO_MAX) return [mp3Path];
   addStep(requestId, "File still >25MB — segmenting …");
   const dir = path.dirname(mp3Path);
   const base = path.basename(mp3Path, ".mp3");
   const pattern = path.join(dir, `${base}.part-%03d.mp3`);
-
-  const segmentSeconds = 900; // 15 minutes
   await new Promise((resolve, reject)=>{
-    ffmpeg(mp3Path)
-      .outputOptions([
-        "-f", "segment",
-        "-segment_time", `${segmentSeconds}`,
-        "-reset_timestamps", "1"
-      ])
-      .save(pattern)
-      .on("end", resolve)
-      .on("error", reject);
+    ffmpeg(mp3Path).outputOptions(["-f","segment","-segment_time","900","-reset_timestamps","1"])
+      .save(pattern).on("end", resolve).on("error", reject);
   });
-
-  const parts = fs.readdirSync(dir)
-    .filter(n => n.startsWith(`${base}.part-`) && n.endsWith(".mp3"))
-    .map(n => path.join(dir, n))
-    .sort();
-
-  addStep(requestId, `Created ${parts.length} segment(s).`);
-  return parts;
+  return fs.readdirSync(dir).filter(n=>n.startsWith(`${base}.part-`)&&n.endsWith(".mp3"))
+    .map(n=>path.join(dir,n)).sort();
 }
 
-// ===== OpenAI: Whisper =====
+// ===== OpenAI =====
 async function openaiTranscribeVerbose(audioPath, requestId){
   try {
     addStep(requestId, "Calling Whisper /transcriptions …");
@@ -270,36 +249,24 @@ async function openaiTranscribeVerbose(audioPath, requestId){
     throw new Error("Transcription failed");
   }
 }
-
-// ===== OpenAI: 原文 → 繁中（嚴格、去英文化） =====
 async function zhTwFromOriginalFaithful(originalText, requestId){
   try {
-    addStep(requestId, "Calling GPT 原文→繁中 (faithful, no English) …");
+    addStep(requestId, "Calling GPT 原文→繁中 (faithful) …");
     const systemPrompt =
 `你是國際會議的專業口筆譯員。請把使用者提供的「原文」完整翻譯成「繁體中文（台灣慣用）」並嚴格遵守：
 1) 忠實轉譯：不可增刪、不可臆測，不加入任何評論；僅做必要語法與詞序調整以使中文通順。
 2) 句序與段落：依原文順序與段落輸出；保留所有重複、口號與語氣詞。
 3) 中英夾雜：凡是非中文的片段（英語詞句、人名地名、短語等）一律翻成中文。不得保留英文單字。
-   - 例：「Hello, it’s a good day today.」→「你好，今天是個好日子。」
-   - 人名採常見譯名或音譯（如 David → 大衛；Barack Obama → 歐巴馬／巴拉克・歐巴馬）。
-   - 常見機構縮寫若無通行中譯可保留（例：NASA、AI），其餘請翻譯或加常見中譯（例：United States of America → 美利堅合眾國）。
-4) 固定譯法（若出現）：Yes, we can. → 是的，我們可以。／ Yes, we did. → 是的，我們做到了。／ God bless you. → 上帝保佑你們。
-5) 標點使用中文全形標點。數字、日期可依中文慣例書寫。
-6) **只輸出中文譯文**，不可夾帶任何英文或說明。`;
-
+4) 標點使用中文全形標點。只輸出中文譯文，不要任何說明。`;
     const r = await axios.post(
       "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        temperature: 0,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: originalText || "" }
-        ]
-      },
-      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+      { model:"gpt-4o-mini", temperature:0, messages:[
+        { role:"system", content: systemPrompt },
+        { role:"user", content: originalText || "" }
+      ]},
+      { headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` } }
     );
-    addStep(requestId, "繁中 (faithful) done.");
+    addStep(requestId, "繁中 done.");
     return r.data?.choices?.[0]?.message?.content?.trim() || "";
   } catch (err) {
     logAxiosError(`[${requestId}] GPT 原文→繁中`, err);
@@ -314,56 +281,52 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
   addStep(requestId, `Accepted: ${fileMeta.originalname} (${(fileMeta.size/1024/1024).toFixed(2)} MB)`);
 
   const model = "whisper-1";
-  let succeeded = false;
-  let errorMessage = "";
   let language = "";
   const fileType = fileMeta.mimetype || "";
   const fileName = fileMeta.originalname || "upload";
   const fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size||0)/(1024*1024))*100)/100);
 
-  // 1) Prepare & (if needed) split for 25MB limit
-  let prepared = null;
-  let parts = [];
+  // 1) Prepare / split
+  let prepared, parts=[];
   try {
     prepared = await prepareMp3UnderLimit(inputPath, requestId);
     parts = await splitIfNeeded(prepared.path, requestId);
   } catch (e) {
-    errorMessage = "Transcode failed: " + (e?.message || e);
-    addStep(requestId, "❌ " + errorMessage);
+    addStep(requestId, "❌ Transcode failed: " + (e?.message || e));
   }
 
   try {
-    // precise seconds for this job (sum over parts or single)
+    // Exact seconds (this job)
     const jobSeconds = await sumSeconds(parts.length ? parts : [prepared.path || inputPath]);
     const minutesForSheet = secsToSheetMinutes(jobSeconds);
-    addStep(requestId, `Duration this job: ${fmtZhSec(jobSeconds)} (sheet minutes = ${minutesForSheet}).`);
 
-    // Cumulative per email from Sheet (minutes) → seconds for email display
-    const pastMinutes = await getPastMinutesForEmail(email);
-    const cumulativeMinutesForSheet = pastMinutes + minutesForSheet;
-    const cumulativeSecondsForEmail = (pastMinutes * 60) + jobSeconds;
-    addStep(requestId, `Cumulative (sheet): ${cumulativeMinutesForSheet} min; email shows ${fmtZhSec(cumulativeSecondsForEmail)}.`);
+    // Cumulative *seconds* from history → derive cumulative minutes for sheet
+    const pastSeconds = await getPastSecondsForEmail(email);
+    const cumulativeSeconds = pastSeconds + jobSeconds;
+    const cumulativeMinutesForSheet = secsToSheetMinutes(cumulativeSeconds);
 
-    // Transcribe original (chunk-aware)
+    addStep(requestId, `Duration this job: ${fmtZhSec(jobSeconds)}; cumulative: ${fmtZhSec(cumulativeSeconds)}.`);
+
+    // Transcribe & translate
     let originalAll = "";
     for (let i=0;i<parts.length;i++){
-      const part = parts[i];
-      if (parts.length > 1) addStep(requestId, `Part ${i+1}/${parts.length} …`);
-      const verbose = await openaiTranscribeVerbose(part, requestId);
+      if (parts.length>1) addStep(requestId, `Part ${i+1}/${parts.length} …`);
+      const verbose = await openaiTranscribeVerbose(parts[i], requestId);
       if (!language) language = verbose.language || "";
-      const originalText = verbose.text || "";
-      originalAll += (originalAll ? "\n\n" : "") + originalText;
+      originalAll += (originalAll ? "\n\n" : "") + (verbose.text || "");
     }
-
-    // Translate ORIGINAL → 繁中
     const zhTraditional = await zhTwFromOriginalFaithful(originalAll, requestId);
 
-    // ===== 中文郵件（只含「繁中譯文」與「原文」） =====
+    // Cost estimate ($5 / 100 min = $0.05 / min)
+    const costThis = (jobSeconds/60 * 0.05);
+    const localStamp = fmtLocalStamp(new Date());
+
+    // Email (Chinese only + original) with timestamp + message + cost
     const mailBody =
 `您的轉寫已完成。
 
-— 本次長度：${fmtZhSec(jobSeconds)}
-— 累計長度：${fmtZhSec(cumulativeSecondsForEmail)}
+— 本次長度：${fmtZhSec(jobSeconds)}（等值費用：$${costThis.toFixed(2)}）
+— 累計長度：${fmtZhSec(cumulativeSeconds)}
 
 ＝＝ 中文（繁體） ＝＝
 ${zhTraditional}
@@ -371,29 +334,36 @@ ${zhTraditional}
 ＝＝ 原文 ＝＝
 ${originalAll}
 
+${localStamp}
+感謝您使用我們的系統，本服務目前免費提供給美國慈濟使用。如在使用過程中有任何問題，歡迎聯絡 626-436-4199（David Lee），感恩您。我們的官網是 www.dottlight.com 如果您還需要轉換逐字稿，隨時歡迎再次使用。
+
+若您覺得我們的服務對您有幫助，也歡迎支持我們。系統的正式使用費用為每 100 分鐘 $5 美元，但我們特別為美國慈濟提供免費使用。您的贊助將協助我們持續優化系統、完善服務，並分擔伺服器、網域維護等開銷。贊助方式：透過 Zelle 轉帳至 626-436-4199，收款方 Dottlight, Inc.
+
 （請求編號：${requestId}）
 （編碼參數：${prepared?.kbps || "?"} kbps，${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts.length>1?`，共 ${parts.length} 個分段`:''}）`;
 
     addStep(requestId, "Sending email …");
     await mailer.sendMail({
-      from: `"逐字稿產生器" <${GMAIL_USER}>`, // ← sender name updated
+      from: `"逐字稿產生器" <${GMAIL_USER}>`,
       to: email,
       subject: "您的轉寫結果（原文與繁體中文）",
       text: mailBody,
     });
     addStep(requestId, "Email sent.");
-    succeeded = true;
 
-    // Append row (per-email cumulative minutes for sheet)
+    // Sheet row (now with seconds + local timestamp)
     try {
       await ensureHeader();
       const row = [
-        new Date().toISOString(),
+        new Date().toISOString(),            // TimestampUTC
+        localStamp,                          // TimestampLocal
         email,
-        minutesForSheet,
-        cumulativeMinutesForSheet,
+        jobSeconds,                          // Seconds
+        cumulativeSeconds,                   // CumulativeSeconds
+        minutesForSheet,                     // Minutes (rounded-up, billing)
+        cumulativeMinutesForSheet,           // CumulativeMinutes (rounded-up from seconds)
         fileName,
-        fileSizeMB || 0,
+        fileSizeMB,
         language || "",
         requestId,
         Date.now() - started,
@@ -404,7 +374,7 @@ ${originalAll}
       ];
       await sheets.spreadsheets.values.append({
         spreadsheetId: SHEET_ID,
-        range: "Sheet1!A:M",
+        range: "Sheet1!A:Q",
         valueInputOption: "RAW",
         requestBody: { values: [row] },
       });
@@ -416,18 +386,23 @@ ${originalAll}
   } catch (err) {
     const eMsg = err?.message || "Processing error";
     addStep(requestId, "❌ " + eMsg);
+    // failure row
     try {
       await ensureHeader();
+      const localStamp = fmtLocalStamp(new Date());
       const row = [
         new Date().toISOString(),
+        localStamp,
         email,
         0,
-        await getPastMinutesForEmail(email),
+        await getPastSecondsForEmail(email),
+        0,
+        secsToSheetMinutes(await getPastSecondsForEmail(email)),
         fileName,
         fileSizeMB || 0,
         "",
         requestId,
-        Date.now() - started, // fixed
+        Date.now() - started,
         false,
         eMsg,
         "whisper-1",
@@ -435,14 +410,14 @@ ${originalAll}
       ];
       await sheets.spreadsheets.values.append({
         spreadsheetId: SHEET_ID,
-        range: "Sheet1!A:M",
+        range: "Sheet1!A:Q",
         valueInputOption: "RAW",
         requestBody: { values: [row] },
       });
     } catch {}
   }
 
-  // Cleanup temp files
+  // Cleanup
   try { fs.unlinkSync(inputPath); } catch {}
   try {
     if (fs.existsSync(inputPath + ".clean.wav")) fs.unlinkSync(inputPath + ".clean.wav");
