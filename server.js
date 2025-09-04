@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import fs from "fs";
+import path from "path";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegStatic from "ffmpeg-static";
 import axios from "axios";
@@ -9,7 +10,6 @@ import FormData from "form-data";
 import nodemailer from "nodemailer";
 import { google } from "googleapis";
 import crypto from "crypto";
-import path from "path";
 
 const app = express();
 app.use(cors({ origin: "*" }));
@@ -29,77 +29,112 @@ if (!OPENAI_API_KEY) fatal("Missing OPENAI_API_KEY");
 if (!GMAIL_USER || !GMAIL_PASS) fatal("Missing GMAIL_USER or GMAIL_PASS");
 if (!SHEET_ID) fatal("Missing SHEET_ID");
 if (!GOOGLE_KEYFILE) fatal("Missing GOOGLE_APPLICATION_CREDENTIALS");
-
 if (!fs.existsSync(GOOGLE_KEYFILE)) fatal(`Key not found at ${GOOGLE_KEYFILE}`);
+
+// read SA email just to show in logs/email footer
 let SA_EMAIL = "";
-try {
-  const j = JSON.parse(fs.readFileSync(GOOGLE_KEYFILE, "utf8"));
-  SA_EMAIL = j.client_email || "";
-  console.log("🔑 Using service account:", SA_EMAIL);
-  console.log("🔑 Key path:", GOOGLE_KEYFILE);
-} catch (e) { fatal("Bad service-account JSON: " + e.message); }
+try { SA_EMAIL = JSON.parse(fs.readFileSync(GOOGLE_KEYFILE,"utf8")).client_email || ""; }
+catch(e){ fatal("Bad service-account JSON: " + e.message); }
 
 // ===== SAFE LOGGING =====
 function logAxiosError(prefix, err) {
   const status = err?.response?.status;
   const code   = err?.code;
-  const msg = err?.response?.data?.error?.message
-          || err?.message
-          || String(err);
+  const msg = err?.response?.data?.error?.message || err?.message || String(err);
   console.error(`${prefix}${status ? " ["+status+"]" : ""}${code ? " ("+code+")" : ""}: ${msg}`);
 }
 
-// ===== GOOGLE CLIENTS =====
+// ===== GOOGLE =====
 const auth = new google.auth.GoogleAuth({
   keyFile: GOOGLE_KEYFILE,
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
 const sheets = google.sheets({ version: "v4", auth });
 
-const transporter = nodemailer.createTransport({
+const mailer = nodemailer.createTransport({
   service: "gmail",
-  auth: { user: GMAIL_USER, pass: GMAIL_PASS },
+  auth: { user: GMAIL_USER, pass: GMAIL_PASS }
 });
 
-// ===== JOB TRACKER (in-memory) =====
-const jobs = new Map(); // id -> { status, steps:[], error, metrics:{} }
-function setJob(id, patch){
-  const cur = jobs.get(id) || { status:"queued", steps:[], error:null, metrics:{} };
-  const next = { ...cur, ...patch };
-  jobs.set(id, next);
-  return next;
-}
+// ===== JOB TRACKING =====
+const jobs = new Map(); // id -> { status, steps[], error, metrics{} }
 function addStep(id, text){
   const cur = jobs.get(id) || { status:"queued", steps:[], error:null, metrics:{} };
   cur.steps.push({ at: new Date().toISOString(), text });
   jobs.set(id, cur);
-  // also log to Render
   console.log(`[${id}] ${text}`);
 }
-
-// In-memory cumulative minutes (sheet is durable)
-let cumulativeMinutes = 0;
-
-// ===== Helpers =====
-function statBytes(p){
-  try { return fs.statSync(p).size; } catch { return 0; }
+function setJob(id, patch){
+  const cur = jobs.get(id) || { status:"queued", steps:[], error:null, metrics:{} };
+  jobs.set(id, { ...cur, ...patch });
 }
+app.get("/status", (req,res)=>{
+  const id = (req.query.id||"").toString();
+  if (!id) return res.status(400).json({ error:"Missing id" });
+  const j = jobs.get(id);
+  if (!j) return res.status(404).json({ error:"Not found" });
+  res.json(j);
+});
+
+// ===== SHEETS HEADER =====
+const HEADER = [
+  "Timestamp","Email","Minutes","CumulativeMinutes","FileName","FileSizeMB",
+  "Language","RequestId","ProcessingMs","Succeeded","ErrorMessage","Model","FileType"
+];
+async function ensureHeader(){
+  try {
+    const got = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: "Sheet1!A1:M1",
+    });
+    const cur = got.data.values?.[0] || [];
+    const ok = HEADER.length === cur.length && HEADER.every((h,i)=>h===cur[i]);
+    if (!ok) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID,
+        range: "Sheet1!A1:M1",
+        valueInputOption: "RAW",
+        requestBody: { values: [HEADER] }
+      });
+    }
+  } catch(e){ console.error("⚠️ ensureHeader:", e.message || e); }
+}
+
+// ===== AUDIO PIPELINE =====
+const OPENAI_AUDIO_MAX = 25 * 1024 * 1024; // ~25 MB
+
+function statBytes(p){ try { return fs.statSync(p).size; } catch { return 0; } }
+
 function getAudioMinutes(filePath){
-  return new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(filePath, (err, meta) => {
+  return new Promise((resolve, reject)=>{
+    ffmpeg.ffprobe(filePath, (err, meta)=>{
       if (err) return reject(err);
-      const seconds = meta?.format?.duration || 0;
-      resolve(Math.max(1, Math.ceil(seconds/60)));
+      const sec = meta?.format?.duration || 0;
+      resolve(Math.max(1, Math.ceil(sec/60)));
     });
   });
 }
 
-// Transcode with speech filters to MP3 mono 16 kHz at a specific bitrate (kbps)
-async function toMp3Filtered(inPath, kbps, requestId){
-  const out = inPath + `.${kbps}k.mp3`;
-  addStep(requestId, `Transcoding with filters at ${kbps} kbps…`);
-  await new Promise((resolve, reject) => {
+// extract audio from any input to an intermediate WAV (for filtering)
+async function extractToWav(inPath, outPath){
+  await new Promise((resolve, reject)=>{
     ffmpeg(inPath)
+      .noVideo()
+      .audioCodec("pcm_s16le")
+      .audioChannels(1)
+      .audioFrequency(16000)
+      .format("wav")
+      .save(outPath)
+      .on("end", resolve)
+      .on("error", reject);
+  });
+  return outPath;
+}
+
+// apply denoise/normalize and encode MP3 mono 16kHz at chosen bitrate
+async function wavToMp3Filtered(inWav, outMp3, kbps){
+  await new Promise((resolve, reject)=>{
+    ffmpeg(inWav)
       .audioFilters([
         "highpass=f=200",
         "lowpass=f=3800",
@@ -112,37 +147,77 @@ async function toMp3Filtered(inPath, kbps, requestId){
         "-b:a", `${kbps}k`,
         "-codec:a", "libmp3lame"
       ])
-      .save(out)
+      .save(outMp3)
       .on("end", resolve)
       .on("error", reject);
   });
-  addStep(requestId, `Transcode ${kbps} kbps done (${(statBytes(out)/1024/1024).toFixed(2)} MB).`);
-  return out;
+  return outMp3;
 }
 
-// Prepare audio for Whisper: try 64k → 48k → 32k → 24k until <= 25 MB
-const OPENAI_AUDIO_MAX = 25 * 1024 * 1024; // ~25 MB
-async function prepareAudioForWhisper(inPath, requestId){
+// Try 64 → 48 → 32 → 24 kbps until ≤ 25 MB
+async function prepareMp3UnderLimit(inMediaPath, requestId){
+  const tmpWav = inMediaPath + ".clean.wav";
+  addStep(requestId, "Extracting audio → WAV …");
+  await extractToWav(inMediaPath, tmpWav);
+
   const ladder = [64, 48, 32, 24]; // kbps
-  for (const kbps of ladder) {
-    const out = await toMp3Filtered(inPath, kbps, requestId);
-    const sz = statBytes(out);
+  for (const kb of ladder){
+    const candidate = inMediaPath + `.${kb}k.mp3`;
+    addStep(requestId, `Encode MP3 ${kb} kbps …`);
+    await wavToMp3Filtered(tmpWav, candidate, kb);
+    const sz = statBytes(candidate);
+    addStep(requestId, `MP3 ${kb} kbps = ${(sz/1024/1024).toFixed(2)} MB`);
     if (sz <= OPENAI_AUDIO_MAX) {
-      addStep(requestId, `Using ${kbps} kbps (final ${(sz/1024/1024).toFixed(2)} MB).`);
-      return { path: out, kbps, bytes: sz };
+      try { fs.unlinkSync(tmpWav); } catch {}
+      return { path: candidate, kbps: kb, bytes: sz };
     }
-    try { fs.unlinkSync(out); } catch {}
+    try { fs.unlinkSync(candidate); } catch {}
   }
-  const out = await toMp3Filtered(inPath, 24, requestId);
-  const sz = statBytes(out);
-  addStep(requestId, `Using 24 kbps (final ${(sz/1024/1024).toFixed(2)} MB).`);
-  return { path: out, kbps: 24, bytes: sz };
+  // keep 24k result anyway
+  const fallback = inMediaPath + `.24k.mp3`;
+  await wavToMp3Filtered(tmpWav, fallback, 24);
+  try { fs.unlinkSync(tmpWav); } catch {}
+  return { path: fallback, kbps: 24, bytes: statBytes(fallback) };
 }
 
-// ===== OpenAI calls (with safe logging) =====
-async function whisperTranscribeVerbose(audioPath, requestId){
+// If still > 25MB (very long audio), split into parts
+async function splitIfNeeded(mp3Path, kbps, requestId){
+  const size = statBytes(mp3Path);
+  if (size <= OPENAI_AUDIO_MAX) return [mp3Path];
+
+  addStep(requestId, "File still >25MB — segmenting …");
+  const dir = path.dirname(mp3Path);
+  const base = path.basename(mp3Path, ".mp3");
+  const pattern = path.join(dir, `${base}.part-%03d.mp3`);
+
+  // estimate segment_time by size ratio; use conservative 15min default
+  const segmentSeconds = 900; // 15 minutes
+  await new Promise((resolve, reject)=>{
+    ffmpeg(mp3Path)
+      .outputOptions([
+        "-f", "segment",
+        "-segment_time", `${segmentSeconds}`,
+        "-reset_timestamps", "1"
+      ])
+      .save(pattern)
+      .on("end", resolve)
+      .on("error", reject);
+  });
+
+  // collect parts
+  const parts = fs.readdirSync(dir)
+    .filter(n => n.startsWith(`${base}.part-`) && n.endsWith(".mp3"))
+    .map(n => path.join(dir, n))
+    .sort();
+
+  addStep(requestId, `Created ${parts.length} segment(s).`);
+  return parts;
+}
+
+// ===== OpenAI calls =====
+async function openaiTranscribeVerbose(audioPath, requestId){
   try {
-    addStep(requestId, "Calling Whisper: /audio/transcriptions …");
+    addStep(requestId, "Calling Whisper /transcriptions …");
     const fd = new FormData();
     fd.append("file", fs.createReadStream(audioPath), { filename: path.basename(audioPath) });
     fd.append("model", "whisper-1");
@@ -152,16 +227,17 @@ async function whisperTranscribeVerbose(audioPath, requestId){
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
       maxBodyLength: Infinity,
     });
-    addStep(requestId, "Whisper transcription done.");
-    return r.data; // { text, language, ... }
+    addStep(requestId, "Transcription done.");
+    return r.data; // { text, language, segments… }
   } catch (err) {
-    logAxiosError(`[${requestId}] Whisper transcribe failed`, err);
+    logAxiosError(`[${requestId}] Whisper transcribe`, err);
     throw new Error("Transcription failed");
   }
 }
-async function whisperTranslateToEnglish(audioPath, requestId){
+
+async function openaiTranslateToEnglish(audioPath, requestId){
   try {
-    addStep(requestId, "Calling Whisper: /audio/translations (EN) …");
+    addStep(requestId, "Calling Whisper /translations (EN) …");
     const fd = new FormData();
     fd.append("file", fs.createReadStream(audioPath), { filename: path.basename(audioPath) });
     fd.append("model", "whisper-1");
@@ -171,16 +247,17 @@ async function whisperTranslateToEnglish(audioPath, requestId){
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
       maxBodyLength: Infinity,
     });
-    addStep(requestId, "Whisper EN translation done.");
+    addStep(requestId, "English translation done.");
     return r.data; // { text }
   } catch (err) {
-    logAxiosError(`[${requestId}] Whisper translate→EN failed`, err);
+    logAxiosError(`[${requestId}] Whisper translate→EN`, err);
     throw new Error("English translation failed");
   }
 }
-async function toTraditionalChinese(text, requestId){
+
+async function gptToTraditionalChinese(text, requestId){
   try {
-    addStep(requestId, "Calling GPT: EN→繁中 …");
+    addStep(requestId, "Calling GPT EN→繁中 …");
     const r = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -193,75 +270,80 @@ async function toTraditionalChinese(text, requestId){
       },
       { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
     );
-    addStep(requestId, "GPT EN→繁中 done.");
+    addStep(requestId, "繁中 translation done.");
     return r.data?.choices?.[0]?.message?.content?.trim() || "";
   } catch (err) {
-    logAxiosError(`[${requestId}] GPT EN→繁中 failed`, err);
+    logAxiosError(`[${requestId}] GPT EN→繁中`, err);
     throw new Error("Traditional Chinese translation failed");
   }
 }
 
-// ===== Sheets header =====
-const HEADER = [
-  "Timestamp","Email","Minutes","CumulativeMinutes","FileName","FileSizeMB",
-  "Language","RequestId","ProcessingMs","Succeeded","ErrorMessage","Model","FileType"
-];
-async function ensureHeader(){
-  try {
-    const get = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
-      range: "Sheet1!A1:M1",
-    });
-    const current = get.data.values?.[0] || [];
-    const ok = HEADER.length === current.length && HEADER.every((h,i)=>h===current[i]);
-    if (!ok) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SHEET_ID,
-        range: "Sheet1!A1:M1",
-        valueInputOption: "RAW",
-        requestBody: { values: [HEADER] },
-      });
-    }
-  } catch (e) {
-    console.error("⚠️ ensureHeader failed:", e.message || e);
-  }
-}
+// ===== PROCESSOR =====
+let cumulativeMinutes = 0;
 
-// ===== Background processor =====
-async function processJob({ email, inputPath, fileMeta, requestId }) {
-  const start = Date.now();
-  setJob(requestId, { status: "processing", metrics: { start }});
-  addStep(requestId, `Accepted from ${email} — ${fileMeta.originalname} — ${(fileMeta.size/1024/1024).toFixed(2)} MB`);
+async function processJob({ email, inputPath, fileMeta, requestId }){
+  const started = Date.now();
+  setJob(requestId, { status:"processing", metrics:{ started } });
+  addStep(requestId, `Accepted: ${fileMeta.originalname} (${(fileMeta.size/1024/1024).toFixed(2)} MB)`);
 
   const model = "whisper-1";
   let succeeded = false;
   let errorMessage = "";
   let minutes = 0;
   let language = "";
-  let fileType = fileMeta.mimetype || "";
-  let fileName = fileMeta.originalname || "upload";
-  let fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size || 0)/(1024*1024))*100)/100);
+  const fileType = fileMeta.mimetype || "";
+  const fileName = fileMeta.originalname || "upload";
+  const fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size||0)/(1024*1024))*100)/100);
 
-  let audio = null;
+  // 1) Prepare MP3 under limit (and split if needed)
+  let prepared = null;
+  let parts = [];
   try {
-    audio = await prepareAudioForWhisper(inputPath, requestId);
+    prepared = await prepareMp3UnderLimit(inputPath, requestId);
+    parts = await splitIfNeeded(prepared.path, prepared.kbps, requestId);
   } catch (e) {
     errorMessage = "Transcode failed: " + (e?.message || e);
     addStep(requestId, "❌ " + errorMessage);
   }
 
   try {
-    minutes = await getAudioMinutes(audio?.path || inputPath);
+    // Total minutes based on final audio
+    minutes = await getAudioMinutes(parts[0] || prepared.path || inputPath);
+    if (parts.length > 1) {
+      // sum durations for all parts
+      let totalSec = 0;
+      for (const p of parts){
+        const sec = await new Promise((resolve, reject)=>{
+          ffmpeg.ffprobe(p, (err, meta)=>{
+            if (err) return reject(err);
+            resolve(meta?.format?.duration || 0);
+          });
+        });
+        totalSec += sec;
+      }
+      minutes = Math.max(1, Math.ceil(totalSec/60));
+    }
     cumulativeMinutes += minutes;
-    addStep(requestId, `Audio minutes: ${minutes} (cumulative ${cumulativeMinutes}).`);
+    addStep(requestId, `Minutes: ${minutes} (cumulative ${cumulativeMinutes}).`);
 
-    const verbose = await whisperTranscribeVerbose(audio?.path || inputPath, requestId);
-    language = verbose.language || "";
-    const originalText = verbose.text || "";
+    // 2) Transcribe + English (chunk-aware)
+    let originalAll = "";
+    let englishAll  = "";
+    for (let i=0;i<parts.length;i++){
+      const part = parts[i];
+      if (parts.length > 1) addStep(requestId, `Part ${i+1}/${parts.length} …`);
+      const verbose = await openaiTranscribeVerbose(part, requestId);
+      if (!language) language = verbose.language || "";
+      const originalText = verbose.text || "";
+      const englishText  = (await openaiTranslateToEnglish(part, requestId)).text || originalText;
+      originalAll += (originalAll ? "\n\n" : "") + originalText;
+      englishAll  += (englishAll  ? "\n\n" : "") + englishText;
+    }
 
-    const englishText = (await whisperTranslateToEnglish(audio?.path || inputPath, requestId)).text || originalText;
-    const zhTraditional = await toTraditionalChinese(englishText || originalText, requestId);
+    // 3) Traditional Chinese (translate once on the stitched English)
+    const zhTraditional = await gptToTraditionalChinese(englishAll || originalAll, requestId);
 
+    // 4) Email
     const mailBody =
 `Your transcription is ready.
 
@@ -269,19 +351,20 @@ async function processJob({ email, inputPath, fileMeta, requestId }) {
 — Cumulative minutes: ${cumulativeMinutes}
 
 == English ==
-${englishText || originalText}
+${englishAll || originalAll}
 
 == 中文（繁體） ==
 ${zhTraditional}
 
 == Original language ==
-${originalText}
+${originalAll}
 
+(Service account: ${SA_EMAIL})
 (RequestId: ${requestId})
-(Encoded: ${audio?.kbps || "?"} kbps, ${(audio?.bytes||0/1024/1024).toFixed(2)} MB)`;
+(Encoded: ${prepared?.kbps || "?"} kbps, ${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts.length>1?`, ${parts.length} segment(s)`:''})`;
 
-    addStep(requestId, "Sending email…");
-    await transporter.sendMail({
+    addStep(requestId, "Sending email …");
+    await mailer.sendMail({
       from: `"Transcription Service" <${GMAIL_USER}>`,
       to: email,
       subject: "Your Bilingual Transcription (EN & 繁體中文)",
@@ -296,7 +379,7 @@ ${originalText}
     addStep(requestId, "❌ " + errorMessage);
   }
 
-  // Append analytics row
+  // 5) Sheet row
   try {
     await ensureHeader();
     const row = [
@@ -308,7 +391,7 @@ ${originalText}
       fileSizeMB || 0,
       language || "",
       requestId,
-      Date.now() - start,
+      Date.now() - started,
       succeeded,
       errorMessage || "",
       model,
@@ -320,26 +403,31 @@ ${originalText}
       valueInputOption: "RAW",
       requestBody: { values: [row] },
     });
-    addStep(requestId, "Sheets row appended.");
-  } catch (sheetErr) {
-    addStep(requestId, "⚠️ Sheets append failed: " + (sheetErr?.message || sheetErr));
+    addStep(requestId, "Sheet updated.");
+  } catch (e) {
+    addStep(requestId, "⚠️ Sheet append failed: " + (e?.message || e));
   }
 
-  // Cleanup temp files
+  // 6) Cleanup
   try { fs.unlinkSync(inputPath); } catch {}
   try {
-    if (audio?.path && fs.existsSync(audio.path)) fs.unlinkSync(audio.path);
-    ["64k","48k","32k","24k"].forEach(k => {
-      const p = inputPath + "." + k + ".mp3";
-      if (fs.existsSync(p)) try { fs.unlinkSync(p); } catch {}
+    if (prepared?.path && fs.existsSync(prepared.path)) fs.unlinkSync(prepared.path);
+    const dir = path.dirname(inputPath);
+    fs.readdirSync(dir).forEach(n=>{
+      if (n.startsWith(path.basename(inputPath)) && (n.endsWith(".mp3") || n.endsWith(".wav")))
+        try { fs.unlinkSync(path.join(dir,n)); } catch {}
     });
   } catch {}
 
-  setJob(requestId, { status: succeeded ? "done" : "error", metrics:{ ...jobs.get(requestId)?.metrics, end: Date.now() }, error: succeeded? null : errorMessage });
+  setJob(requestId, {
+    status: succeeded ? "done" : "error",
+    error: succeeded ? null : errorMessage,
+    metrics: { ...jobs.get(requestId)?.metrics, finished: Date.now() }
+  });
   addStep(requestId, succeeded ? "✅ Done" : "❌ Finished with error");
 }
 
-// ===== Immediate-ack upload =====
+// ===== ROUTES =====
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     const email = (req.body.email || "").trim();
@@ -348,32 +436,24 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     const requestId = crypto.randomUUID();
     setJob(requestId, { status:"accepted", steps:[], error:null, metrics:{} });
-    addStep(requestId, "Upload accepted by server.");
-    res.status(202).json({ success: true, accepted: true, requestId });
+    addStep(requestId, "Upload accepted.");
 
-    setImmediate(() =>
-      processJob({ email, inputPath: req.file.path, fileMeta: req.file, requestId })
-        .catch(e => {
-          addStep(requestId, "❌ Background job crash: " + (e?.message || e));
-          setJob(requestId, { status:"error", error: e?.message || String(e) });
-        })
+    // respond immediately so your page doesn't wait
+    res.status(202).json({ success:true, accepted:true, requestId });
+
+    // background processing
+    setImmediate(()=>processJob({ email, inputPath: req.file.path, fileMeta: req.file, requestId })
+      .catch(e=>{
+        addStep(requestId, "❌ Background crash: " + (e?.message || e));
+        setJob(requestId, { status:"error", error: e?.message || String(e) });
+      })
     );
-
   } catch (err) {
-    console.error("❌ Error accepting upload:", err?.message || err);
+    console.error("❌ accept error:", err?.message || err);
     res.status(500).json({ error: "Processing failed at accept stage" });
   }
 });
 
-// ===== Status endpoint =====
-app.get("/status", (req, res) => {
-  const id = (req.query.id || "").toString();
-  if (!id) return res.status(400).json({ error: "Missing id" });
-  const j = jobs.get(id);
-  if (!j) return res.status(404).json({ error: "Not found" });
-  res.json(j);
-});
-
-app.get("/", (_req, res) => res.send("✅ Whisper backend running"));
+app.get("/", (_req, res)=>res.send("✅ Whisper backend running"));
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
+app.listen(port, ()=>console.log(`🚀 Server listening on port ${port}`));
