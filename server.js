@@ -159,15 +159,10 @@ async function processJob({ email, inputPath, fileMeta, requestId }) {
   const mp3Path = inputPath + ".mp3";
 
   try {
-    // Convert to **speech-optimized** MP3: mono, 16 kHz, 64 kbps
+    // Convert to speech-optimized MP3: mono, 16 kHz, 64 kbps
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
-        .outputOptions([
-          "-vn",       // no video
-          "-ac 1",     // mono
-          "-ar 16000", // 16 kHz sample rate (good for speech)
-          "-b:a 64k"   // 64 kbps audio bitrate
-        ])
+        .outputOptions([ "-vn", "-ac 1", "-ar 16000", "-b:a 64k" ])
         .save(mp3Path)
         .on("end", resolve)
         .on("error", reject);
@@ -257,10 +252,11 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "File is required" });
 
     const requestId = crypto.randomUUID();
-    // Respond immediately so the browser isn't stuck waiting
-    res.status(202).json({ accepted: true, requestId });
 
-    // Process in background (fire-and-forget)
+    // ✅ Frontend-friendly: include success:true
+    res.status(202).json({ success: true, accepted: true, requestId });
+
+    // Background processing (fire-and-forget)
     setImmediate(() =>
       processJob({ email, inputPath: req.file.path, fileMeta: req.file, requestId })
         .catch(e => console.error("Background job failed:", e))
