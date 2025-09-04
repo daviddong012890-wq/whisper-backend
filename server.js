@@ -11,7 +11,7 @@ import { google } from "googleapis";
 import crypto from "crypto";
 
 const app = express();
-app.use(cors({ origin: "*" })); // lock to your domain later if desired
+app.use(cors({ origin: "*" })); // you can lock to your domain later
 const upload = multer({ dest: "/tmp" });
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
@@ -36,9 +36,7 @@ try {
   SA_EMAIL = j.client_email || "";
   console.log("🔑 Using service account:", SA_EMAIL);
   console.log("🔑 Key path:", GOOGLE_KEYFILE);
-} catch (e) {
-  fatal("Bad service-account JSON: " + e.message);
-}
+} catch (e) { fatal("Bad service-account JSON: " + e.message); }
 
 // Google Sheets client
 const auth = new google.auth.GoogleAuth({
@@ -47,13 +45,13 @@ const auth = new google.auth.GoogleAuth({
 });
 const sheets = google.sheets({ version: "v4", auth });
 
-// Gmail SMTP
+// Email (Gmail SMTP)
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: { user: GMAIL_USER, pass: GMAIL_PASS },
 });
 
-// Cumulative minutes (resets on Render restart; sheet is your durable ledger)
+// Cumulative minutes (resets on Render restart; sheet is the durable ledger)
 let cumulativeMinutes = 0;
 
 // ===== Helpers =====
@@ -67,7 +65,7 @@ function getAudioMinutes(filePath){
   });
 }
 
-// Whisper original-language transcription (verbose to get language)
+// Whisper with verbose JSON (so we get auto-detected language)
 async function whisperTranscribeVerbose(mp3Path){
   const fd = new FormData();
   fd.append("file", fs.createReadStream(mp3Path));
@@ -83,7 +81,6 @@ async function whisperTranscribeVerbose(mp3Path){
   return { text: j.text || "", language: j.language || "" };
 }
 
-// Whisper translate→English (always English)
 async function whisperTranslateToEnglish(mp3Path){
   const fd = new FormData();
   fd.append("file", fs.createReadStream(mp3Path));
@@ -121,7 +118,7 @@ async function toTraditionalChinese(text){
   return j.choices?.[0]?.message?.content?.trim() || "";
 }
 
-// Ensure header row exists
+// Ensure header row exists (analytics columns)
 const HEADER = [
   "Timestamp","Email","Minutes","CumulativeMinutes","FileName","FileSizeMB",
   "Language","RequestId","ProcessingMs","Succeeded","ErrorMessage","Model","FileType"
@@ -133,8 +130,8 @@ async function ensureHeader(){
       range: "Sheet1!A1:M1",
     });
     const current = get.data.values?.[0] || [];
-    const matches = HEADER.length === current.length && HEADER.every((h,i)=>h===current[i]);
-    if (!matches) {
+    const same = HEADER.length === current.length && HEADER.every((h,i)=>h===current[i]);
+    if (!same) {
       await sheets.spreadsheets.values.update({
         spreadsheetId: SHEET_ID,
         range: "Sheet1!A1:M1",
@@ -147,46 +144,38 @@ async function ensureHeader(){
   }
 }
 
-// ===== Main upload =====
-app.post("/upload", upload.single("file"), async (req, res) => {
+// ===== Background processor =====
+async function processJob({ email, inputPath, fileMeta, requestId }) {
   const start = Date.now();
-  const requestId = crypto.randomUUID();
-
+  const model = "whisper-1";
   let succeeded = false;
   let errorMessage = "";
-  let responsePayload = {};
-  let language = "";
   let minutes = 0;
-  let fileName = "";
-  let fileSizeMB = 0;
-  let fileType = "";
-  const model = "whisper-1";
+  let language = "";
+  let fileType = fileMeta.mimetype || "";
+  let fileName = fileMeta.originalname || "upload";
+  let fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size || 0)/(1024*1024))*100)/100);
 
-  const inputPath = req.file?.path;
-  const mp3Path   = inputPath ? inputPath + ".mp3" : null;
+  const mp3Path = inputPath + ".mp3";
 
   try {
-    const email = (req.body.email || "").trim();
-    if (!email) throw new Error("Email is required");
-    if (!inputPath) throw new Error("File is required");
-
-    // 1) Extract audio → MP3
+    // Convert to **speech-optimized** MP3: mono, 16 kHz, 64 kbps
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
-        .outputOptions(["-vn", "-ar 44100", "-ac 2", "-b:a 192k"])
+        .outputOptions([
+          "-vn",       // no video
+          "-ac 1",     // mono
+          "-ar 16000", // 16 kHz sample rate (good for speech)
+          "-b:a 64k"   // 64 kbps audio bitrate
+        ])
         .save(mp3Path)
         .on("end", resolve)
         .on("error", reject);
     });
 
-    // 2) File info + duration
-    minutes     = await getAudioMinutes(mp3Path);
+    minutes = await getAudioMinutes(mp3Path);
     cumulativeMinutes += minutes;
-    fileName    = req.file.originalname || "upload";
-    fileType    = req.file.mimetype || "";
-    fileSizeMB  = Math.max(0.01, Math.round(((req.file.size || 0)/(1024*1024))*100)/100);
 
-    // 3) Transcribe + EN + 繁體
     const [{ text: originalText, language: langCode }, englishText] = await Promise.all([
       whisperTranscribeVerbose(mp3Path),
       whisperTranslateToEnglish(mp3Path),
@@ -195,7 +184,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     const zhTraditional = await toTraditionalChinese(englishText || originalText);
 
-    // 4) Email (EN + 繁體 + original)
     const mailBody =
 `Your transcription is ready.
 
@@ -222,25 +210,18 @@ ${originalText}
     });
 
     succeeded = true;
-    responsePayload = {
-      success: true,
-      minutes,
-      cumulativeMinutes,
-      fileName,
-      fileSizeMB,
-      requestId,
-    };
+
   } catch (err) {
     errorMessage = err?.message || String(err);
-    console.error("❌ Error processing upload:", err);
+    console.error("❌ Error processing upload (requestId " + requestId + "):", err);
   }
 
-  // 5) Append row (always attempt, even on failure)
+  // Append analytics row (even on failure)
   try {
     await ensureHeader();
     const row = [
       new Date().toISOString(),
-      req.body.email || "",
+      email,
       minutes || 0,
       cumulativeMinutes || 0,
       fileName,
@@ -263,15 +244,31 @@ ${originalText}
     console.error("⚠️ Sheets append failed (continuing):", sheetErr?.message || sheetErr);
   }
 
-  // 6) Cleanup temp files
-  try { if (inputPath) fs.unlinkSync(inputPath); } catch {}
-  try { if (mp3Path)   fs.unlinkSync(mp3Path);   } catch {}
+  // Cleanup temp files
+  try { fs.unlinkSync(inputPath); } catch {}
+  try { fs.unlinkSync(mp3Path);   } catch {}
+}
 
-  // 7) Response
-  if (succeeded) {
-    res.json(responsePayload);
-  } else {
-    res.status(500).json({ error: "Processing failed", requestId });
+// ===== Immediate-ack upload endpoint =====
+app.post("/upload", upload.single("file"), async (req, res) => {
+  try {
+    const email = (req.body.email || "").trim();
+    if (!email) return res.status(400).json({ error: "Email is required" });
+    if (!req.file) return res.status(400).json({ error: "File is required" });
+
+    const requestId = crypto.randomUUID();
+    // Respond immediately so the browser isn't stuck waiting
+    res.status(202).json({ accepted: true, requestId });
+
+    // Process in background (fire-and-forget)
+    setImmediate(() =>
+      processJob({ email, inputPath: req.file.path, fileMeta: req.file, requestId })
+        .catch(e => console.error("Background job failed:", e))
+    );
+
+  } catch (err) {
+    console.error("❌ Error accepting upload:", err);
+    res.status(500).json({ error: "Processing failed at accept stage" });
   }
 });
 
