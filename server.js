@@ -31,7 +31,7 @@ if (!SHEET_ID) fatal("Missing SHEET_ID");
 if (!GOOGLE_KEYFILE) fatal("Missing GOOGLE_APPLICATION_CREDENTIALS");
 if (!fs.existsSync(GOOGLE_KEYFILE)) fatal(`Key not found at ${GOOGLE_KEYFILE}`);
 
-// read SA email just to show in logs/email footer
+// read SA email for footer
 let SA_EMAIL = "";
 try { SA_EMAIL = JSON.parse(fs.readFileSync(GOOGLE_KEYFILE,"utf8")).client_email || ""; }
 catch(e){ fatal("Bad service-account JSON: " + e.message); }
@@ -212,7 +212,7 @@ async function splitIfNeeded(mp3Path, kbps, requestId){
   return parts;
 }
 
-// ===== OpenAI: Whisper =====
+// ===== OpenAI: Whisper (original-language transcript) =====
 async function openaiTranscribeVerbose(audioPath, requestId){
   try {
     addStep(requestId, "Calling Whisper /transcriptions …");
@@ -232,42 +232,22 @@ async function openaiTranscribeVerbose(audioPath, requestId){
     throw new Error("Transcription failed");
   }
 }
-async function openaiTranslateToEnglish(audioPath, requestId){
-  try {
-    addStep(requestId, "Calling Whisper /translations (EN) …");
-    const fd = new FormData();
-    fd.append("file", fs.createReadStream(audioPath), { filename: path.basename(audioPath) });
-    fd.append("model", "whisper-1");
-    fd.append("translate", "true");
-    fd.append("temperature", "0");
-    const r = await axios.post("https://api.openai.com/v1/audio/translations", fd, {
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
-      maxBodyLength: Infinity,
-    });
-    addStep(requestId, "English translation done.");
-    return r.data; // { text }
-  } catch (err) {
-    logAxiosError(`[${requestId}] Whisper translate→EN`, err);
-    throw new Error("English translation failed");
-  }
-}
 
-// ===== OpenAI: STRICT EN→繁中 =====
-async function strictZhTwTranslate(englishText, requestId){
+// ===== OpenAI: ORIGINAL → 繁中 (faithful) =====
+async function zhTwFromOriginalFaithful(originalText, requestId){
   try {
-    addStep(requestId, "Calling GPT EN→繁中 (strict) …");
+    addStep(requestId, "Calling GPT 原文→繁中 (faithful) …");
     const systemPrompt =
-`你是專業口筆譯員。請「逐句、忠實」將英文翻成「繁體中文（台灣用字）」，並嚴格遵守：
-1) 不可增刪、不改寫、不意譯；只做必要的語法轉換。
-2) 保留重複與修辭（例如連續出現的 "Thank you." 必須完整保留次數）。
-3) 依原文段落與換行輸出；不要合併或拆分句子。
-4) 專有名詞固定：
+`你是國際會議口筆譯員。請將使用者提供的「原文」直接翻譯成「繁體中文（台灣用字）」並嚴格遵守：
+1) 忠實轉譯：不得增刪、不得改寫，不得加入任何評論或判斷；只做必要語法調整以使中文順暢。
+2) 句序與段落：依原文順序與段落輸出；不要合併或拆分句子；保留所有重複與口號（例如多次出現的 "Thank you." 必須照數量保留）。
+3) 專有名詞與固定譯法：
    - United States of America → 美利堅合眾國
    - Yes, we can. → 是的，我們可以。
    - Yes, we did. → 是的，我們做到了。
    - God bless you. → 上帝保佑你們。
-5) 標點：中文全形標點；數字、專名、日期照原文保留或慣用譯名。
-6) 只輸出中文譯文，**不得**加入任何說明或註解。`;
+4) 標點：使用中文全形標點；日期、數字、專名慣用譯名可沿用或採常見譯名。
+5) **只輸出中文譯文**，不得加入任何說明、標籤或解釋。`;
 
     const r = await axios.post(
       "https://api.openai.com/v1/chat/completions",
@@ -276,15 +256,15 @@ async function strictZhTwTranslate(englishText, requestId){
         temperature: 0,
         messages: [
           { role: "system", content: systemPrompt },
-          { role: "user", content: englishText || "" }
+          { role: "user", content: originalText || "" }
         ]
       },
       { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
     );
-    addStep(requestId, "繁中 (strict) done.");
+    addStep(requestId, "繁中 (faithful) done.");
     return r.data?.choices?.[0]?.message?.content?.trim() || "";
   } catch (err) {
-    logAxiosError(`[${requestId}] GPT EN→繁中 (strict)`, err);
+    logAxiosError(`[${requestId}] GPT 原文→繁中`, err);
     throw new Error("Traditional Chinese translation failed");
   }
 }
@@ -336,32 +316,26 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
     cumulativeMinutes += minutes;
     addStep(requestId, `Minutes: ${minutes} (cumulative ${cumulativeMinutes}).`);
 
-    // 2) Transcribe + English (chunk-aware)
+    // 2) Transcribe original (chunk-aware)
     let originalAll = "";
-    let englishAll  = "";
     for (let i=0;i<parts.length;i++){
       const part = parts[i];
       if (parts.length > 1) addStep(requestId, `Part ${i+1}/${parts.length} …`);
       const verbose = await openaiTranscribeVerbose(part, requestId);
       if (!language) language = verbose.language || "";
       const originalText = verbose.text || "";
-      const englishText  = (await openaiTranslateToEnglish(part, requestId)).text || originalText;
       originalAll += (originalAll ? "\n\n" : "") + originalText;
-      englishAll  += (englishAll  ? "\n\n" : "") + englishText;
     }
 
-    // 3) Strict Traditional Chinese
-    const zhTraditional = await strictZhTwTranslate(englishAll || originalAll, requestId);
+    // 3) Translate ORIGINAL → 繁中 (faithful)
+    const zhTraditional = await zhTwFromOriginalFaithful(originalAll, requestId);
 
-    // 4) Email
+    // 4) Email (ONLY Chinese + Original)
     const mailBody =
 `Your transcription is ready.
 
 — Minutes: ${minutes}
 — Cumulative minutes: ${cumulativeMinutes}
-
-== English ==
-${englishAll || originalAll}
 
 == 中文（繁體） ==
 ${zhTraditional}
@@ -377,7 +351,7 @@ ${originalAll}
     await mailer.sendMail({
       from: `"Transcription Service" <${GMAIL_USER}>`,
       to: email,
-      subject: "Your Bilingual Transcription (EN & 繁體中文)",
+      subject: "Your Transcription (原文 & 繁體中文)",
       text: mailBody,
     });
     addStep(requestId, "Email sent.");
@@ -389,7 +363,7 @@ ${originalAll}
     addStep(requestId, "❌ " + errorMessage);
   }
 
-  // 5) Sheet row
+  // 5) Sheet row (unchanged schema)
   try {
     await ensureHeader();
     const row = [
