@@ -17,6 +17,7 @@
     "ffmpeg-static": "^5.2.0",
     "fluent-ffmpeg": "^2.1.2",
     "nodemailer": "^6.9.11",
-    "googleapis": "^144.0.0"
+    "googleapis": "^144.0.0",
+    "cors": "^2.8.5"
   }
 }
