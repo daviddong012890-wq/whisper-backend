@@ -325,7 +325,9 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
     const mailBody =
 `您的轉寫已完成。
 ${localStamp}
+
 本次上傳時長：${fmtZhSec(jobSeconds)}
+
 您的逐字稿旅程
 已累積時長：${fmtZhSec(cumulativeSeconds)}
 
