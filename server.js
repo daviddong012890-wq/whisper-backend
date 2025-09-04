@@ -190,7 +190,6 @@ async function splitIfNeeded(mp3Path, kbps, requestId){
   const base = path.basename(mp3Path, ".mp3");
   const pattern = path.join(dir, `${base}.part-%03d.mp3`);
 
-  // estimate segment_time by size ratio; use conservative 15min default
   const segmentSeconds = 900; // 15 minutes
   await new Promise((resolve, reject)=>{
     ffmpeg(mp3Path)
@@ -204,7 +203,6 @@ async function splitIfNeeded(mp3Path, kbps, requestId){
       .on("error", reject);
   });
 
-  // collect parts
   const parts = fs.readdirSync(dir)
     .filter(n => n.startsWith(`${base}.part-`) && n.endsWith(".mp3"))
     .map(n => path.join(dir, n))
@@ -214,7 +212,7 @@ async function splitIfNeeded(mp3Path, kbps, requestId){
   return parts;
 }
 
-// ===== OpenAI calls =====
+// ===== OpenAI: Whisper =====
 async function openaiTranscribeVerbose(audioPath, requestId){
   try {
     addStep(requestId, "Calling Whisper /transcriptions …");
@@ -234,7 +232,6 @@ async function openaiTranscribeVerbose(audioPath, requestId){
     throw new Error("Transcription failed");
   }
 }
-
 async function openaiTranslateToEnglish(audioPath, requestId){
   try {
     addStep(requestId, "Calling Whisper /translations (EN) …");
@@ -255,25 +252,39 @@ async function openaiTranslateToEnglish(audioPath, requestId){
   }
 }
 
-async function gptToTraditionalChinese(text, requestId){
+// ===== OpenAI: STRICT EN→繁中 =====
+async function strictZhTwTranslate(englishText, requestId){
   try {
-    addStep(requestId, "Calling GPT EN→繁中 …");
+    addStep(requestId, "Calling GPT EN→繁中 (strict) …");
+    const systemPrompt =
+`你是專業口筆譯員。請「逐句、忠實」將英文翻成「繁體中文（台灣用字）」，並嚴格遵守：
+1) 不可增刪、不改寫、不意譯；只做必要的語法轉換。
+2) 保留重複與修辭（例如連續出現的 "Thank you." 必須完整保留次數）。
+3) 依原文段落與換行輸出；不要合併或拆分句子。
+4) 專有名詞固定：
+   - United States of America → 美利堅合眾國
+   - Yes, we can. → 是的，我們可以。
+   - Yes, we did. → 是的，我們做到了。
+   - God bless you. → 上帝保佑你們。
+5) 標點：中文全形標點；數字、專名、日期照原文保留或慣用譯名。
+6) 只輸出中文譯文，**不得**加入任何說明或註解。`;
+
     const r = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
         model: "gpt-4o-mini",
+        temperature: 0,
         messages: [
-          { role: "system", content: "你是專業翻譯，請將使用者的英文內容翻譯為自然、精準、正式的繁體中文（保留專有名詞）。不得添加任何評論或說明。" },
-          { role: "user", content: text || "" }
-        ],
-        temperature: 0.2
+          { role: "system", content: systemPrompt },
+          { role: "user", content: englishText || "" }
+        ]
       },
       { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
     );
-    addStep(requestId, "繁中 translation done.");
+    addStep(requestId, "繁中 (strict) done.");
     return r.data?.choices?.[0]?.message?.content?.trim() || "";
   } catch (err) {
-    logAxiosError(`[${requestId}] GPT EN→繁中`, err);
+    logAxiosError(`[${requestId}] GPT EN→繁中 (strict)`, err);
     throw new Error("Traditional Chinese translation failed");
   }
 }
@@ -310,7 +321,6 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
     // Total minutes based on final audio
     minutes = await getAudioMinutes(parts[0] || prepared.path || inputPath);
     if (parts.length > 1) {
-      // sum durations for all parts
       let totalSec = 0;
       for (const p of parts){
         const sec = await new Promise((resolve, reject)=>{
@@ -340,8 +350,8 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
       englishAll  += (englishAll  ? "\n\n" : "") + englishText;
     }
 
-    // 3) Traditional Chinese (translate once on the stitched English)
-    const zhTraditional = await gptToTraditionalChinese(englishAll || originalAll, requestId);
+    // 3) Strict Traditional Chinese
+    const zhTraditional = await strictZhTwTranslate(englishAll || originalAll, requestId);
 
     // 4) Email
     const mailBody =
@@ -438,10 +448,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     setJob(requestId, { status:"accepted", steps:[], error:null, metrics:{} });
     addStep(requestId, "Upload accepted.");
 
-    // respond immediately so your page doesn't wait
     res.status(202).json({ success:true, accepted:true, requestId });
 
-    // background processing
     setImmediate(()=>processJob({ email, inputPath: req.file.path, fileMeta: req.file, requestId })
       .catch(e=>{
         addStep(requestId, "❌ Background crash: " + (e?.message || e));
