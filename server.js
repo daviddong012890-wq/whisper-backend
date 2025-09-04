@@ -4,14 +4,15 @@ import multer from "multer";
 import fs from "fs";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegStatic from "ffmpeg-static";
-import fetch from "node-fetch";
+import axios from "axios";
 import FormData from "form-data";
 import nodemailer from "nodemailer";
 import { google } from "googleapis";
 import crypto from "crypto";
 
 const app = express();
-app.use(cors({ origin: "*" })); // you can lock to your domain later
+app.use(cors({ origin: "*" }));
+app.options("*", cors());
 const upload = multer({ dest: "/tmp" });
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
@@ -20,7 +21,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GMAIL_USER     = process.env.GMAIL_USER;
 const GMAIL_PASS     = process.env.GMAIL_PASS;
 const SHEET_ID       = process.env.SHEET_ID;
-const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS; // /etc/secrets/gcp-sa.json
+const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS;
 
 function fatal(m){ console.error("❌ " + m); process.exit(1); }
 if (!OPENAI_API_KEY) fatal("Missing OPENAI_API_KEY");
@@ -28,7 +29,6 @@ if (!GMAIL_USER || !GMAIL_PASS) fatal("Missing GMAIL_USER or GMAIL_PASS");
 if (!SHEET_ID) fatal("Missing SHEET_ID");
 if (!GOOGLE_KEYFILE) fatal("Missing GOOGLE_APPLICATION_CREDENTIALS");
 
-// verify key file + show which SA we’re using
 if (!fs.existsSync(GOOGLE_KEYFILE)) fatal(`Key not found at ${GOOGLE_KEYFILE}`);
 let SA_EMAIL = "";
 try {
@@ -45,13 +45,13 @@ const auth = new google.auth.GoogleAuth({
 });
 const sheets = google.sheets({ version: "v4", auth });
 
-// Email (Gmail SMTP)
+// Gmail SMTP
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: { user: GMAIL_USER, pass: GMAIL_PASS },
 });
 
-// Cumulative minutes (resets on Render restart; sheet is the durable ledger)
+// Cumulative minutes (resets on restart; sheet is durable)
 let cumulativeMinutes = 0;
 
 // ===== Helpers =====
@@ -65,60 +65,79 @@ function getAudioMinutes(filePath){
   });
 }
 
-// Whisper with verbose JSON (so we get auto-detected language)
-async function whisperTranscribeVerbose(mp3Path){
+// Convert any input to WAV mono 16k PCM with speech-friendly filters
+async function toCleanWav(inPath){
+  const out = inPath + ".wav";
+  await new Promise((resolve, reject) => {
+    ffmpeg(inPath)
+      // denoise-ish chain: remove rumble & hiss, normalize dialog
+      .audioFilters([
+        "highpass=f=200",
+        "lowpass=f=3800",
+        "dynaudnorm"
+      ])
+      .outputOptions([
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ac", "1",
+        "-ar", "16000",
+        "-f", "wav"
+      ])
+      .save(out)
+      .on("end", resolve)
+      .on("error", reject);
+  });
+  return out;
+}
+
+// Whisper (verbose JSON -> language)
+async function whisperTranscribeVerbose(wavPath){
   const fd = new FormData();
-  fd.append("file", fs.createReadStream(mp3Path));
+  fd.append("file", fs.createReadStream(wavPath), { filename: "audio.wav" });
   fd.append("model", "whisper-1");
   fd.append("response_format", "verbose_json");
-  const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: fd,
+  fd.append("temperature", "0");
+
+  const r = await axios.post("https://api.openai.com/v1/audio/transcriptions", fd, {
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
+    maxBodyLength: Infinity,
   });
-  const j = await r.json();
-  if (!r.ok) throw new Error(`Whisper transcribe failed: ${JSON.stringify(j)}`);
-  return { text: j.text || "", language: j.language || "" };
+  return r.data; // { text, language, ... }
 }
 
-async function whisperTranslateToEnglish(mp3Path){
+// Whisper translate -> English
+async function whisperTranslateToEnglish(wavPath){
   const fd = new FormData();
-  fd.append("file", fs.createReadStream(mp3Path));
+  fd.append("file", fs.createReadStream(wavPath), { filename: "audio.wav" });
   fd.append("model", "whisper-1");
   fd.append("translate", "true");
-  const r = await fetch("https://api.openai.com/v1/audio/translations", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: fd,
+  fd.append("temperature", "0");
+
+  const r = await axios.post("https://api.openai.com/v1/audio/translations", fd, {
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
+    maxBodyLength: Infinity,
   });
-  const j = await r.json();
-  if (!r.ok) throw new Error(`Whisper translate failed: ${JSON.stringify(j)}`);
-  return j.text || "";
+  return r.data; // { text }
 }
 
-// GPT: English → Traditional Chinese (繁體)
+// GPT: EN -> Traditional Chinese
 async function toTraditionalChinese(text){
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
+  const r = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
       model: "gpt-4o-mini",
       messages: [
         { role: "system", content: "你是專業翻譯，請將使用者的英文內容翻譯為自然、精準、正式的繁體中文（保留專有名詞）。不得添加任何評論或說明。" },
         { role: "user", content: text || "" }
       ],
       temperature: 0.2
-    }),
-  });
-  const j = await r.json();
-  if (!r.ok) throw new Error(`Traditional Chinese translation failed: ${JSON.stringify(j)}`);
-  return j.choices?.[0]?.message?.content?.trim() || "";
+    },
+    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+  );
+  return r.data?.choices?.[0]?.message?.content?.trim() || "";
 }
 
-// Ensure header row exists (analytics columns)
+// Ensure sheet header
 const HEADER = [
   "Timestamp","Email","Minutes","CumulativeMinutes","FileName","FileSizeMB",
   "Language","RequestId","ProcessingMs","Succeeded","ErrorMessage","Model","FileType"
@@ -130,8 +149,8 @@ async function ensureHeader(){
       range: "Sheet1!A1:M1",
     });
     const current = get.data.values?.[0] || [];
-    const same = HEADER.length === current.length && HEADER.every((h,i)=>h===current[i]);
-    if (!same) {
+    const ok = HEADER.length === current.length && HEADER.every((h,i)=>h===current[i]);
+    if (!ok) {
       await sheets.spreadsheets.values.update({
         spreadsheetId: SHEET_ID,
         range: "Sheet1!A1:M1",
@@ -140,7 +159,7 @@ async function ensureHeader(){
       });
     }
   } catch (e) {
-    console.error("⚠️ ensureHeader failed (continuing):", e.message || e);
+    console.error("⚠️ ensureHeader failed:", e.message || e);
   }
 }
 
@@ -156,27 +175,17 @@ async function processJob({ email, inputPath, fileMeta, requestId }) {
   let fileName = fileMeta.originalname || "upload";
   let fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size || 0)/(1024*1024))*100)/100);
 
-  const mp3Path = inputPath + ".mp3";
+  const wavPath = await toCleanWav(inputPath).catch(e => { throw e; });
 
   try {
-    // Convert to speech-optimized MP3: mono, 16 kHz, 64 kbps
-    await new Promise((resolve, reject) => {
-      ffmpeg(inputPath)
-        .outputOptions([ "-vn", "-ac 1", "-ar 16000", "-b:a 64k" ])
-        .save(mp3Path)
-        .on("end", resolve)
-        .on("error", reject);
-    });
-
-    minutes = await getAudioMinutes(mp3Path);
+    minutes = await getAudioMinutes(wavPath);
     cumulativeMinutes += minutes;
 
-    const [{ text: originalText, language: langCode }, englishText] = await Promise.all([
-      whisperTranscribeVerbose(mp3Path),
-      whisperTranslateToEnglish(mp3Path),
-    ]);
-    language = langCode || "";
+    const verbose = await whisperTranscribeVerbose(wavPath);
+    language = verbose.language || "";
+    const originalText = verbose.text || "";
 
+    const englishText = (await whisperTranslateToEnglish(wavPath)).text || originalText;
     const zhTraditional = await toTraditionalChinese(englishText || originalText);
 
     const mailBody =
@@ -211,7 +220,7 @@ ${originalText}
     console.error("❌ Error processing upload (requestId " + requestId + "):", err);
   }
 
-  // Append analytics row (even on failure)
+  // Append analytics row
   try {
     await ensureHeader();
     const row = [
@@ -236,15 +245,15 @@ ${originalText}
       requestBody: { values: [row] },
     });
   } catch (sheetErr) {
-    console.error("⚠️ Sheets append failed (continuing):", sheetErr?.message || sheetErr);
+    console.error("⚠️ Sheets append failed:", sheetErr?.message || sheetErr);
   }
 
-  // Cleanup temp files
+  // Cleanup
   try { fs.unlinkSync(inputPath); } catch {}
-  try { fs.unlinkSync(mp3Path);   } catch {}
+  try { fs.unlinkSync(wavPath);   } catch {}
 }
 
-// ===== Immediate-ack upload endpoint =====
+// ===== Immediate-ack upload =====
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     const email = (req.body.email || "").trim();
@@ -252,11 +261,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "File is required" });
 
     const requestId = crypto.randomUUID();
-
-    // ✅ Frontend-friendly: include success:true
     res.status(202).json({ success: true, accepted: true, requestId });
 
-    // Background processing (fire-and-forget)
     setImmediate(() =>
       processJob({ email, inputPath: req.file.path, fileMeta: req.file, requestId })
         .catch(e => console.error("Background job failed:", e))
@@ -270,7 +276,4 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
 app.get("/", (_req, res) => res.send("✅ Whisper backend running"));
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`🚀 Server listening on port ${port}`);
-  console.log("🔎 GOOGLE_APPLICATION_CREDENTIALS =", GOOGLE_KEYFILE);
-});
+app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
