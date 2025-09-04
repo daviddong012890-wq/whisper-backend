@@ -31,9 +31,8 @@ if (!SHEET_ID) fatal("Missing SHEET_ID");
 if (!GOOGLE_KEYFILE) fatal("Missing GOOGLE_APPLICATION_CREDENTIALS");
 if (!fs.existsSync(GOOGLE_KEYFILE)) fatal(`Key not found at ${GOOGLE_KEYFILE}`);
 
-// read SA email for footer (non-secret)
-let SA_EMAIL = "";
-try { SA_EMAIL = JSON.parse(fs.readFileSync(GOOGLE_KEYFILE,"utf8")).client_email || ""; }
+// Optionally parse JSON only to validate the key file (we no longer show SA email)
+try { JSON.parse(fs.readFileSync(GOOGLE_KEYFILE,"utf8")); }
 catch(e){ fatal("Bad service-account JSON: " + e.message); }
 
 // ===== SAFE LOGGING =====
@@ -131,14 +130,31 @@ const OPENAI_AUDIO_MAX = 25 * 1024 * 1024; // ~25 MB hard API limit
 
 function statBytes(p){ try { return fs.statSync(p).size; } catch { return 0; } }
 
-function getAudioMinutes(filePath){
+// precise seconds for a single media file
+function getSeconds(filePath){
   return new Promise((resolve, reject)=>{
     ffmpeg.ffprobe(filePath, (err, meta)=>{
       if (err) return reject(err);
-      const sec = meta?.format?.duration || 0;
-      resolve(Math.max(1, Math.ceil(sec/60)));
+      const sec = Number(meta?.format?.duration) || 0;
+      resolve(sec);
     });
   });
+}
+// sum seconds over an array of paths; round to integer seconds
+async function sumSeconds(paths){
+  let total = 0;
+  for (const p of paths) total += await getSeconds(p);
+  return Math.round(total);
+}
+// minutes to write to sheet (ceil, min 1)
+function secsToSheetMinutes(sec){
+  return Math.max(1, Math.ceil((sec||0)/60));
+}
+function fmtZhSec(sec){
+  const s = Math.max(0, Math.round(sec||0));
+  const m = Math.floor(s/60);
+  const r = s % 60;
+  return `${m} 分 ${r} 秒`;
 }
 
 async function extractToWav(inPath, outPath){
@@ -300,7 +316,6 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
   const model = "whisper-1";
   let succeeded = false;
   let errorMessage = "";
-  let minutes = 0;
   let language = "";
   const fileType = fileMeta.mimetype || "";
   const fileName = fileMeta.originalname || "upload";
@@ -318,27 +333,16 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
   }
 
   try {
-    // Minutes
-    minutes = await getAudioMinutes(parts[0] || prepared.path || inputPath);
-    if (parts.length > 1) {
-      let totalSec = 0;
-      for (const p of parts){
-        const sec = await new Promise((resolve, reject)=>{
-          ffmpeg.ffprobe(p, (err, meta)=>{
-            if (err) return reject(err);
-            resolve(meta?.format?.duration || 0);
-          });
-        });
-        totalSec += sec;
-      }
-      minutes = Math.max(1, Math.ceil(totalSec/60));
-    }
-    addStep(requestId, `Minutes this job: ${minutes}.`);
+    // precise seconds for this job (sum over parts or single)
+    const jobSeconds = await sumSeconds(parts.length ? parts : [prepared.path || inputPath]);
+    const minutesForSheet = secsToSheetMinutes(jobSeconds);
+    addStep(requestId, `Duration this job: ${fmtZhSec(jobSeconds)} (sheet minutes = ${minutesForSheet}).`);
 
-    // Cumulative per email from Sheet
-    const past = await getPastMinutesForEmail(email);
-    const cumulativeForEmail = past + minutes;
-    addStep(requestId, `Cumulative for ${email}: ${past} + ${minutes} = ${cumulativeForEmail}.`);
+    // Cumulative per email from Sheet (minutes) → seconds for email display
+    const pastMinutes = await getPastMinutesForEmail(email);
+    const cumulativeMinutesForSheet = pastMinutes + minutesForSheet;
+    const cumulativeSecondsForEmail = (pastMinutes * 60) + jobSeconds;
+    addStep(requestId, `Cumulative (sheet): ${cumulativeMinutesForSheet} min; email shows ${fmtZhSec(cumulativeSecondsForEmail)}.`);
 
     // Transcribe original (chunk-aware)
     let originalAll = "";
@@ -358,8 +362,8 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
     const mailBody =
 `您的轉寫已完成。
 
-— 本次分鐘數：${minutes}
-— 累計分鐘數（此 Email）：${cumulativeForEmail}
+— 本次長度：${fmtZhSec(jobSeconds)}
+— 累計長度：${fmtZhSec(cumulativeSecondsForEmail)}
 
 ＝＝ 中文（繁體） ＝＝
 ${zhTraditional}
@@ -367,13 +371,12 @@ ${zhTraditional}
 ＝＝ 原文 ＝＝
 ${originalAll}
 
-（服務帳戶：${SA_EMAIL}）
 （請求編號：${requestId}）
 （編碼參數：${prepared?.kbps || "?"} kbps，${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts.length>1?`，共 ${parts.length} 個分段`:''}）`;
 
     addStep(requestId, "Sending email …");
     await mailer.sendMail({
-      from: `"轉寫服務" <${GMAIL_USER}>`,
+      from: `"逐字稿產生器" <${GMAIL_USER}>`, // ← sender name updated
       to: email,
       subject: "您的轉寫結果（原文與繁體中文）",
       text: mailBody,
@@ -381,14 +384,14 @@ ${originalAll}
     addStep(requestId, "Email sent.");
     succeeded = true;
 
-    // Append row (per-email cumulative)
+    // Append row (per-email cumulative minutes for sheet)
     try {
       await ensureHeader();
       const row = [
         new Date().toISOString(),
         email,
-        minutes || 0,
-        cumulativeForEmail || 0,
+        minutesForSheet,
+        cumulativeMinutesForSheet,
         fileName,
         fileSizeMB || 0,
         language || "",
@@ -424,7 +427,7 @@ ${originalAll}
         fileSizeMB || 0,
         "",
         requestId,
-        Date.now() - Date.now(),
+        Date.now() - started, // fixed
         false,
         eMsg,
         "whisper-1",
