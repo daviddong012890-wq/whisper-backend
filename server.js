@@ -324,9 +324,10 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
     // Email (Chinese only + original) with timestamp + message + cost
     const mailBody =
 `您的轉寫已完成。
-
-— 本次長度：${fmtZhSec(jobSeconds)}（等值費用：$${costThis.toFixed(2)}）
-— 累計長度：${fmtZhSec(cumulativeSeconds)}
+${localStamp}
+本次上傳時長：${fmtZhSec(jobSeconds)}
+您的逐字稿旅程
+已累積時長：${fmtZhSec(cumulativeSeconds)}
 
 ＝＝ 中文（繁體） ＝＝
 ${zhTraditional}
@@ -334,11 +335,16 @@ ${zhTraditional}
 ＝＝ 原文 ＝＝
 ${originalAll}
 
-${localStamp}
-感謝您使用我們的系統，本服務目前免費提供給美國慈濟使用。如在使用過程中有任何問題，歡迎聯絡 626-436-4199（David Lee），感恩您。我們的官網是 www.dottlight.com 如果您還需要轉換逐字稿，隨時歡迎再次使用。
+＝＝ 頁尾 ＝＝
+請注意，本服務為自動化機器翻譯，其內容僅供參考，我們不保證其百分之百的正確性、完整性或即時性。逐字稿可能包含錯誤、遺漏或雜訊。您的视频音訊均受到嚴格保護，在處理完畢後，您的原始檔案會立即被刪除，以確保您的隱私。
 
-若您覺得我們的服務對您有幫助，也歡迎支持我們。系統的正式使用費用為每 100 分鐘 $5 美元，但我們特別為美國慈濟提供免費使用。您的贊助將協助我們持續優化系統、完善服務，並分擔伺服器、網域維護等開銷。贊助方式：透過 Zelle 轉帳至 626-436-4199，收款方 Dottlight, Inc.
+感謝您使用我們的逐字稿服務。本服務的正式使用費用為每 100 分鐘 $5 美元，但目前特別為美國慈濟的用戶提供免費使用。若您在使用上有任何問題，歡迎隨時聯絡 David Lee（電話：626-436-4199）
 
+如果您認為我們的服務對您有所幫助並願意支持我們，您的贊助將協助我們持續優化系統與服務。您可透過 Zelle 轉帳至 626-436-4199，收款方為 Dottlight, Inc.
+
+此外，若您還有其他語音檔案需要轉換，歡迎隨時再次使用我們的服務。我們的官網是 www.dottlight.com.
+
+本次使用費用 (已為您減免)：$${costThis.toFixed(2)}
 （請求編號：${requestId}）
 （編碼參數：${prepared?.kbps || "?"} kbps，${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts.length>1?`，共 ${parts.length} 個分段`:''}）`;
 
