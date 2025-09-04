@@ -101,12 +101,11 @@ async function ensureHeader(){
 }
 
 // ===== PER-EMAIL CUMULATIVE (from durable history) =====
-// Sum Minutes (column C, index 2) for rows where Email (B) matches AND Succeeded (J, index 9) == TRUE.
 async function getPastMinutesForEmail(email){
   try {
     const resp = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: "Sheet1!A2:J", // include Succeeded column
+      range: "Sheet1!A2:J",
       valueRenderOption: "UNFORMATTED_VALUE",
     });
     const rows = resp.data.values || [];
@@ -142,7 +141,6 @@ function getAudioMinutes(filePath){
   });
 }
 
-// Extract audio to WAV (for filtering)
 async function extractToWav(inPath, outPath){
   await new Promise((resolve, reject)=>{
     ffmpeg(inPath)
@@ -158,7 +156,6 @@ async function extractToWav(inPath, outPath){
   return outPath;
 }
 
-// Denoise/normalize then MP3 mono 16 kHz at given bitrate
 async function wavToMp3Filtered(inWav, outMp3, kbps){
   await new Promise((resolve, reject)=>{
     ffmpeg(inWav)
@@ -200,14 +197,12 @@ async function prepareMp3UnderLimit(inMediaPath, requestId){
     }
     try { fs.unlinkSync(candidate); } catch {}
   }
-  // keep 24k result anyway
   const fallback = inMediaPath + `.24k.mp3`;
   await wavToMp3Filtered(tmpWav, fallback, 24);
   try { fs.unlinkSync(tmpWav); } catch {}
   return { path: fallback, kbps: 24, bytes: statBytes(fallback) };
 }
 
-// If still > 25MB (very long audio), split into parts
 async function splitIfNeeded(mp3Path, requestId){
   const size = statBytes(mp3Path);
   if (size <= OPENAI_AUDIO_MAX) return [mp3Path];
@@ -239,7 +234,7 @@ async function splitIfNeeded(mp3Path, requestId){
   return parts;
 }
 
-// ===== OpenAI: Whisper (original-language transcript) =====
+// ===== OpenAI: Whisper =====
 async function openaiTranscribeVerbose(audioPath, requestId){
   try {
     addStep(requestId, "Calling Whisper /transcriptions …");
@@ -253,14 +248,14 @@ async function openaiTranscribeVerbose(audioPath, requestId){
       maxBodyLength: Infinity,
     });
     addStep(requestId, "Transcription done.");
-    return r.data; // { text, language, segments… }
+    return r.data;
   } catch (err) {
     logAxiosError(`[${requestId}] Whisper transcribe`, err);
     throw new Error("Transcription failed");
   }
 }
 
-// ===== OpenAI: 原文 → 繁體中文（嚴格、去英文化） =====
+// ===== OpenAI: 原文 → 繁中（嚴格、去英文化） =====
 async function zhTwFromOriginalFaithful(originalText, requestId){
   try {
     addStep(requestId, "Calling GPT 原文→繁中 (faithful, no English) …");
@@ -269,7 +264,7 @@ async function zhTwFromOriginalFaithful(originalText, requestId){
 1) 忠實轉譯：不可增刪、不可臆測，不加入任何評論；僅做必要語法與詞序調整以使中文通順。
 2) 句序與段落：依原文順序與段落輸出；保留所有重複、口號與語氣詞。
 3) 中英夾雜：凡是非中文的片段（英語詞句、人名地名、短語等）一律翻成中文。不得保留英文單字。
-   - 例： “Hello, it’s a good day today.” → 「你好，今天是個好日子。」
+   - 例：「Hello, it’s a good day today.」→「你好，今天是個好日子。」
    - 人名採常見譯名或音譯（如 David → 大衛；Barack Obama → 歐巴馬／巴拉克・歐巴馬）。
    - 常見機構縮寫若無通行中譯可保留（例：NASA、AI），其餘請翻譯或加常見中譯（例：United States of America → 美利堅合眾國）。
 4) 固定譯法（若出現）：Yes, we can. → 是的，我們可以。／ Yes, we did. → 是的，我們做到了。／ God bless you. → 上帝保佑你們。
@@ -340,7 +335,7 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
     }
     addStep(requestId, `Minutes this job: ${minutes}.`);
 
-    // Per-email cumulative from Sheet (sum of prior successes)
+    // Cumulative per email from Sheet
     const past = await getPastMinutesForEmail(email);
     const cumulativeForEmail = past + minutes;
     addStep(requestId, `Cumulative for ${email}: ${past} + ${minutes} = ${cumulativeForEmail}.`);
@@ -356,44 +351,44 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
       originalAll += (originalAll ? "\n\n" : "") + originalText;
     }
 
-    // Translate ORIGINAL → 繁中（嚴格、去英文化）
+    // Translate ORIGINAL → 繁中
     const zhTraditional = await zhTwFromOriginalFaithful(originalAll, requestId);
 
-    // Email (ONLY Chinese + Original)
+    // ===== 中文郵件（只含「繁中譯文」與「原文」） =====
     const mailBody =
-`Your transcription is ready.
+`您的轉寫已完成。
 
-— Minutes: ${minutes}
-— Cumulative minutes: ${cumulativeForEmail}
+— 本次分鐘數：${minutes}
+— 累計分鐘數（此 Email）：${cumulativeForEmail}
 
-== 中文（繁體） ==
+＝＝ 中文（繁體） ＝＝
 ${zhTraditional}
 
-== Original language ==
+＝＝ 原文 ＝＝
 ${originalAll}
 
-(Service account: ${SA_EMAIL})
-(RequestId: ${requestId})
-(Encoded: ${prepared?.kbps || "?"} kbps, ${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts.length>1?`, ${parts.length} segment(s)`:''})`;
+（服務帳戶：${SA_EMAIL}）
+（請求編號：${requestId}）
+（編碼參數：${prepared?.kbps || "?"} kbps，${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts.length>1?`，共 ${parts.length} 個分段`:''}）`;
 
     addStep(requestId, "Sending email …");
     await mailer.sendMail({
-      from: `"Transcription Service" <${GMAIL_USER}>`,
+      from: `"轉寫服務" <${GMAIL_USER}>`,
       to: email,
-      subject: "Your Transcription (原文 & 繁體中文)",
+      subject: "您的轉寫結果（原文與繁體中文）",
       text: mailBody,
     });
     addStep(requestId, "Email sent.");
     succeeded = true;
 
-    // Append *per-email* cumulative to Sheet
+    // Append row (per-email cumulative)
     try {
       await ensureHeader();
       const row = [
         new Date().toISOString(),
         email,
         minutes || 0,
-        cumulativeForEmail || 0, // per-email cumulative
+        cumulativeForEmail || 0,
         fileName,
         fileSizeMB || 0,
         language || "",
@@ -418,7 +413,6 @@ ${originalAll}
   } catch (err) {
     const eMsg = err?.message || "Processing error";
     addStep(requestId, "❌ " + eMsg);
-    // Still write a failure row
     try {
       await ensureHeader();
       const row = [
@@ -430,7 +424,7 @@ ${originalAll}
         fileSizeMB || 0,
         "",
         requestId,
-        Date.now() - started,
+        Date.now() - Date.now(),
         false,
         eMsg,
         "whisper-1",
@@ -475,7 +469,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     setJob(requestId, { status:"accepted", steps:[], error:null, metrics:{} });
     addStep(requestId, "Upload accepted.");
 
-    // Fast ACK; work happens in background
     res.status(202).json({ success:true, accepted:true, requestId });
 
     setImmediate(()=>processJob({ email, inputPath: req.file.path, fileMeta: req.file, requestId })
