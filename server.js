@@ -2,7 +2,6 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import fs from "fs";
-import path from "path";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegStatic from "ffmpeg-static";
 import fetch from "node-fetch";
@@ -11,7 +10,7 @@ import nodemailer from "nodemailer";
 import { google } from "googleapis";
 
 const app = express();
-app.use(cors({ origin: "*" })); // lock to https://dottlight.com later if you want
+app.use(cors({ origin: "*" })); // lock to https://dottlight.com later if you wish
 const upload = multer({ dest: "/tmp" });
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
@@ -27,11 +26,11 @@ function fatal(msg) { console.error("❌ " + msg); process.exit(1); }
 if (!OPENAI_API_KEY) fatal("Missing OPENAI_API_KEY");
 if (!GMAIL_USER || !GMAIL_PASS) fatal("Missing GMAIL_USER or GMAIL_PASS");
 if (!SHEET_ID) fatal("Missing SHEET_ID");
-if (!GOOGLE_KEYFILE) fatal("Missing GOOGLE_APPLICATION_CREDENTIALS (path to your service-account JSON)");
+if (!GOOGLE_KEYFILE) fatal("Missing GOOGLE_APPLICATION_CREDENTIALS (path to service-account JSON)");
 
-// ===== Verify key file exists & show the service-account email =====
+// verify key file + show which SA we’re using
 if (!fs.existsSync(GOOGLE_KEYFILE)) {
-  fatal(`Service-account key file not found at ${GOOGLE_KEYFILE}. Did you add it as a Secret File on Render and set GOOGLE_APPLICATION_CREDENTIALS to /etc/secrets/gcp-sa.json?`);
+  fatal(`Service-account key not found at ${GOOGLE_KEYFILE}. Did you add it as a Secret File and set GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/gcp-sa.json?`);
 }
 let SA_EMAIL = "";
 try {
@@ -41,10 +40,10 @@ try {
   console.log("🔑 Using service account:", SA_EMAIL);
   console.log("🔑 Key path:", GOOGLE_KEYFILE);
 } catch (e) {
-  fatal("Could not read/parse service-account JSON: " + e.message);
+  fatal("Could not parse service-account JSON: " + e.message);
 }
 
-// ===== Google Sheets (explicitly point to the key file) =====
+// ===== Google Sheets (explicit keyFile) =====
 const auth = new google.auth.GoogleAuth({
   keyFile: GOOGLE_KEYFILE,
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
@@ -57,9 +56,10 @@ const transporter = nodemailer.createTransport({
   auth: { user: GMAIL_USER, pass: GMAIL_PASS },
 });
 
-// ===== Helpers =====
+// cumulative minutes (resets on instance restart; Sheet keeps history)
 let cumulativeMinutes = 0;
 
+// helpers
 function getAudioMinutes(filePath) {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, meta) => {
@@ -109,7 +109,7 @@ async function translateToChinese(text) {
     body: JSON.stringify({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: "You are a precise translator. Translate to clear, natural Simplified Chinese without adding commentary." },
+        { role: "system", content: "Translate the user content into clear, natural Simplified Chinese. No extra commentary." },
         { role: "user", content: text || "" }
       ],
       temperature: 0.2
@@ -120,15 +120,85 @@ async function translateToChinese(text) {
   return j.choices?.[0]?.message?.content?.trim() || "";
 }
 
-// ===== Main upload endpoint =====
+// ===== Main upload =====
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     const email = (req.body.email || "").trim();
     if (!email) return res.status(400).json({ error: "Email is required" });
 
-    const inputPath = req.file.path;
-    const mp3Path = inputPath + ".mp3";
+    const inputPath = req.file.path;       // uploaded file on temp disk
+    const mp3Path   = inputPath + ".mp3";  // extracted audio
 
-    // Extract audio to MP3
+    // 1) Extract audio → MP3
     await new Promise((resolve, reject) => {
-      ffmpeg(inp
+      ffmpeg(inputPath)
+        .outputOptions(["-vn", "-ar 44100", "-ac 2", "-b:a 192k"])
+        .save(mp3Path)
+        .on("end", resolve)
+        .on("error", reject);
+    });
+
+    // 2) Duration
+    const minutes = await getAudioMinutes(mp3Path);
+    cumulativeMinutes += minutes;
+
+    // 3) Transcribe (original) + English + Chinese
+    const [originalText, englishText] = await Promise.all([
+      whisperTranscribe(mp3Path),
+      whisperTranslateToEnglish(mp3Path),
+    ]);
+    const chineseText = await translateToChinese(englishText || originalText);
+
+    // 4) Log to Google Sheet (Date | Email | Minutes | Cumulative | Preview)
+    const nowIso = new Date().toISOString();
+    const preview = (englishText || originalText).slice(0, 120);
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: "Sheet1!A:E",
+      valueInputOption: "RAW",
+      requestBody: { values: [[nowIso, email, minutes, cumulativeMinutes, preview]] },
+    });
+
+    // 5) Email
+    const mailBody =
+`Your transcription is ready.
+
+— Minutes: ${minutes}
+— Cumulative minutes: ${cumulativeMinutes}
+
+== English ==
+${englishText || originalText}
+
+== Chinese (中文) ==
+${chineseText}
+
+== Original language ==
+${originalText}
+
+(Service account used: ${SA_EMAIL})`;
+
+    await transporter.sendMail({
+      from: `"Transcription Service" <${GMAIL_USER}>`,
+      to: email,
+      subject: "Your Bilingual Transcription (EN & 中文)",
+      text: mailBody,
+    });
+
+    // 6) Cleanup
+    try { fs.unlinkSync(inputPath); } catch {}
+    try { fs.unlinkSync(mp3Path);   } catch {}
+
+    // 7) Frontend response
+    res.json({ success: true, minutes, cumulativeMinutes, preview });
+  } catch (err) {
+    console.error("❌ Error processing upload:", err);
+    res.status(500).json({ error: "Processing failed" });
+  }
+});
+
+app.get("/", (_req, res) => res.send("✅ Whisper backend running"));
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`🚀 Server listening on port ${port}`);
+  console.log("🔎 GOOGLE_APPLICATION_CREDENTIALS =", GOOGLE_KEYFILE);
+});
