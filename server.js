@@ -136,7 +136,6 @@ function truthy(x){
   const s = String(x ?? "").trim().toLowerCase();
   return s === "true" || s === "1" || s === "yes";
 }
-// Build a column-index map from whatever header is present
 async function getColumnMap(){
   const hdr = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
@@ -150,7 +149,6 @@ async function getColumnMap(){
     idxSeconds:         map["Seconds"],
     idxMinutes:         map["Minutes"],
     idxSucceeded:       map["Succeeded"],
-    // legacy fallback if Succeeded wasn’t where we expect
     legacySucceededIdx: (map["Succeeded"] ?? 9),
   };
 }
@@ -292,8 +290,9 @@ async function zhTwFromOriginalFaithful(originalText, requestId){
 `你是國際會議的專業口筆譯員。請把使用者提供的「原文」完整翻譯成「繁體中文（台灣慣用）」並嚴格遵守：
 1) 忠實轉譯：不可增刪、不可臆測，不加入任何評論；僅做必要語法與詞序調整以使中文通順。
 2) 句序與段落：依原文順序與段落輸出；保留所有重複、口號與語氣詞。
-3) 中英夾雜：凡是非中文的片段（英語詞句、人名地名、短語等）一律翻成中文。不得保留英文單字。
-4) 標點使用中文全形標點。只輸出中文譯文，不要任何說明。`;
+3) 中英夾雜：凡是非中文的片段（英語、法語、西班牙語、德語、日語、韓語等任何語種的詞句、人名地名、術語）一律翻成中文。不得保留原語言（含英文）單字。
+4) 標點使用中文全形標點。只輸出中文譯文，不要任何說明。
+5) 適用範圍：以上規則（1–4）不論原文語言為何（只要 Whisper 能辨識的語言）皆一體適用；專有名詞採常見中譯或音譯，若無通行譯名則以自然音譯呈現，亦不得夾帶原文括註。`;
     const r = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       { model:"gpt-4o-mini", temperature:0, messages:[
@@ -359,7 +358,18 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
     const costThis = (jobSeconds/60 * 0.05);
     const localStamp = fmtLocalStamp(new Date());
 
-    // Email (Chinese only + original) with timestamp + message + cost
+    // Build .txt attachment content (UTF-8)
+    const attachmentText =
+`＝＝ 中文（繁體） ＝＝
+${zhTraditional}
+
+＝＝ 原文 ＝＝
+${originalAll}
+`;
+    const safeBase = (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
+    const attachmentName = `${safeBase}-${requestId}.txt`;
+
+    // Email (Chinese only + original) with timestamp + message + cost + attachment note
     const mailBody =
 `您的轉寫已完成。
 ${localStamp}
@@ -376,15 +386,17 @@ ${zhTraditional}
 ${originalAll}
 
 ＝＝ 頁尾 ＝＝
-請注意，本服務為自動化機器翻譯，其內容僅供參考，我們不保證其百分之百的正確性、完整性或即時性。逐字稿可能包含錯誤、遺漏或雜訊。您的视频音訊均受到嚴格保護，在處理完畢後，您的原始檔案會立即被刪除，以確保您的隱私。
+感謝您使用我們的逐字稿服務。請注意，本服務為自動化機器翻譯，其內容僅供參考，我們不保證其百分之百的正確性、完整性或即時性。逐字稿可能包含錯誤、遺漏或雜訊。您的视频音訊均受到嚴格保護，在處理完畢後，您的原始檔案會立即被刪除，以確保您的隱私。
 
-感謝您使用我們的逐字稿服務。本服務的正式使用費用為每 100 分鐘 $5 美元，但目前特別為美國慈濟的用戶提供免費使用。若您在使用上有任何問題，歡迎隨時聯絡 David Lee（電話：626-436-4199）
+本服務的正式使用費用為每 100 分鐘 $5 美元，但目前特別為美國慈濟的用戶提供免費使用。若您在使用上有任何問題，歡迎隨時聯絡 David Lee（電話/簡訊：626-436-4199）
 
 如果您認為我們的服務對您有所幫助並願意支持我們，您的贊助將協助我們持續優化系統與服務。您可透過 Zelle 轉帳至 626-436-4199，收款方為 Dottlight, Inc.
 
 此外，若您還有其他語音檔案需要轉換，歡迎隨時再次使用我們的服務。我們的官網是 www.dottlight.com.
 
 本次使用費用 (已為您減免)：$${costThis.toFixed(2)}
+
+附件為本次逐字稿的 .txt 文件，方便您下載或複製到其他軟體使用。
 
 （請求編號：${requestId}）
 （編碼參數：${prepared?.kbps || "?"} kbps，${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts && parts.length>1?`，共 ${parts.length} 個分段`:''}）`;
@@ -395,6 +407,13 @@ ${originalAll}
       to: email,
       subject: "您的轉寫結果（原文與繁體中文）",
       text: mailBody,
+      attachments: [
+        {
+          filename: attachmentName,
+          content: attachmentText,          // UTF-8 text
+          contentType: "text/plain; charset=utf-8"
+        }
+      ]
     });
     addStep(requestId, "Email sent.");
 
