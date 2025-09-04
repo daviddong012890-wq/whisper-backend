@@ -9,7 +9,7 @@ import nodemailer from "nodemailer";
 import { google } from "googleapis";
 
 const app = express();
-const upload = multer({ dest: "/tmp" }); // temp storage on Render
+const upload = multer({ dest: "/tmp" }); // Render temporary storage
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
 // ENV vars
@@ -19,17 +19,17 @@ const GMAIL_PASS = process.env.GMAIL_PASS;
 const SHEET_ID = process.env.SHEET_ID;
 
 if (!OPENAI_API_KEY || !GMAIL_USER || !GMAIL_PASS || !SHEET_ID) {
-  console.error("Missing environment variables!");
+  console.error("❌ Missing environment variables!");
   process.exit(1);
 }
 
-// Google Sheets auth
+// Google Sheets setup
 const auth = new google.auth.GoogleAuth({
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
 const sheets = google.sheets({ version: "v4", auth });
 
-// Nodemailer transporter
+// Nodemailer setup
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
@@ -38,9 +38,20 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// Track cumulative minutes in memory (reset if service restarts)
+// Track cumulative minutes (resets if Render restarts)
 let cumulativeMinutes = 0;
 
+// Helper → get duration using ffmpeg
+function getAudioDuration(filePath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, metadata) => {
+      if (err) return reject(err);
+      resolve(metadata.format.duration / 60); // minutes
+    });
+  });
+}
+
+// Main upload route
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     const email = req.body.email;
@@ -49,7 +60,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const inputPath = req.file.path;
     const outputPath = inputPath + ".mp3";
 
-    // Extract audio
+    // Convert to MP3
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .outputOptions(["-vn", "-ar 44100", "-ac 2", "-b:a 192k"])
@@ -58,7 +69,11 @@ app.post("/upload", upload.single("file"), async (req, res) => {
         .on("error", reject);
     });
 
-    // Send to Whisper
+    // Get duration
+    const durationMinutes = Math.ceil(await getAudioDuration(outputPath));
+    cumulativeMinutes += durationMinutes;
+
+    // Send audio to Whisper
     const formData = new FormData();
     formData.append("file", fs.createReadStream(outputPath));
     formData.append("model", "whisper-1");
@@ -68,47 +83,42 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
       body: formData,
     });
-
     const result = await response.json();
+
     if (!result.text) throw new Error("Whisper failed: " + JSON.stringify(result));
 
-    // Estimate minutes from file size (better: use ffprobe duration)
-    const stats = fs.statSync(outputPath);
-    const minutes = Math.ceil(stats.size / (192 * 1024 * 60)); // rough est. at 192 kbps
-    cumulativeMinutes += minutes;
-
-    // Log to Google Sheet
+    // Log to Google Sheets
     const now = new Date().toISOString();
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: "Sheet1!A:E",
       valueInputOption: "RAW",
       requestBody: {
-        values: [[now, email, minutes, cumulativeMinutes, result.text.substring(0, 100)]],
+        values: [[now, email, durationMinutes, cumulativeMinutes, result.text.substring(0, 100)]],
       },
     });
 
-    // Send email
+    // Send email with transcript
     await transporter.sendMail({
       from: `"Transcription Service" <${GMAIL_USER}>`,
       to: email,
       subject: "Your Transcription Result",
-      text: `Here is your transcription:\n\n${result.text}\n\n---\nMinutes: ${minutes}\nCumulative: ${cumulativeMinutes}`,
+      text: `Here is your transcription:\n\n${result.text}\n\n---\nMinutes: ${durationMinutes}\nCumulative: ${cumulativeMinutes}`,
     });
 
-    // Cleanup
+    // Clean up
     fs.unlinkSync(inputPath);
     fs.unlinkSync(outputPath);
 
     res.json({ success: true, transcript: result.text });
   } catch (err) {
-    console.error(err);
+    console.error("❌ Error processing upload:", err);
     res.status(500).json({ error: "Processing failed" });
   }
 });
 
 // Health check
-app.get("/", (req, res) => res.send("Whisper backend running ✅"));
+app.get("/", (req, res) => res.send("✅ Whisper backend running"));
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server listening on port ${port}`));
+app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
