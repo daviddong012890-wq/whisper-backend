@@ -9,6 +9,7 @@ import FormData from "form-data";
 import nodemailer from "nodemailer";
 import { google } from "googleapis";
 import crypto from "crypto";
+import path from "path";
 
 const app = express();
 app.use(cors({ origin: "*" }));
@@ -51,10 +52,13 @@ const transporter = nodemailer.createTransport({
   auth: { user: GMAIL_USER, pass: GMAIL_PASS },
 });
 
-// Cumulative minutes (resets on restart; sheet is durable)
+// In-memory cumulative minutes (sheet is the durable ledger)
 let cumulativeMinutes = 0;
 
 // ===== Helpers =====
+function statBytes(p){
+  try { return fs.statSync(p).size; } catch { return 0; }
+}
 function getAudioMinutes(filePath){
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, meta) => {
@@ -65,12 +69,11 @@ function getAudioMinutes(filePath){
   });
 }
 
-// Convert any input to WAV mono 16k PCM with speech-friendly filters
-async function toCleanWav(inPath){
-  const out = inPath + ".wav";
+// Transcode with speech filters to MP3 mono 16 kHz at a specific bitrate (kbps)
+async function toMp3Filtered(inPath, kbps){
+  const out = inPath + `.${kbps}k.mp3`;
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
-      // denoise-ish chain: remove rumble & hiss, normalize dialog
       .audioFilters([
         "highpass=f=200",
         "lowpass=f=3800",
@@ -78,10 +81,10 @@ async function toCleanWav(inPath){
       ])
       .outputOptions([
         "-vn",
-        "-acodec", "pcm_s16le",
         "-ac", "1",
         "-ar", "16000",
-        "-f", "wav"
+        "-b:a", `${kbps}k`,
+        "-codec:a", "libmp3lame"
       ])
       .save(out)
       .on("end", resolve)
@@ -90,10 +93,26 @@ async function toCleanWav(inPath){
   return out;
 }
 
+// Prepare audio for Whisper: try 64k → 48k → 32k → 24k until <= 25 MB
+const OPENAI_AUDIO_MAX = 25 * 1024 * 1024; // ~25 MB
+async function prepareAudioForWhisper(inPath){
+  const ladder = [64, 48, 32, 24]; // kbps
+  for (const kbps of ladder) {
+    const out = await toMp3Filtered(inPath, kbps);
+    const sz = statBytes(out);
+    if (sz <= OPENAI_AUDIO_MAX) return { path: out, kbps, bytes: sz };
+    // too big, try next lower bitrate and delete this bigger file
+    try { fs.unlinkSync(out); } catch {}
+  }
+  // If even 24 kbps is > 25 MB (very long audio), just return 24k version anyway.
+  const out = await toMp3Filtered(inPath, 24);
+  return { path: out, kbps: 24, bytes: statBytes(out) };
+}
+
 // Whisper (verbose JSON -> language)
-async function whisperTranscribeVerbose(wavPath){
+async function whisperTranscribeVerbose(audioPath){
   const fd = new FormData();
-  fd.append("file", fs.createReadStream(wavPath), { filename: "audio.wav" });
+  fd.append("file", fs.createReadStream(audioPath), { filename: path.basename(audioPath) });
   fd.append("model", "whisper-1");
   fd.append("response_format", "verbose_json");
   fd.append("temperature", "0");
@@ -106,9 +125,9 @@ async function whisperTranscribeVerbose(wavPath){
 }
 
 // Whisper translate -> English
-async function whisperTranslateToEnglish(wavPath){
+async function whisperTranslateToEnglish(audioPath){
   const fd = new FormData();
-  fd.append("file", fs.createReadStream(wavPath), { filename: "audio.wav" });
+  fd.append("file", fs.createReadStream(audioPath), { filename: path.basename(audioPath) });
   fd.append("model", "whisper-1");
   fd.append("translate", "true");
   fd.append("temperature", "0");
@@ -175,17 +194,26 @@ async function processJob({ email, inputPath, fileMeta, requestId }) {
   let fileName = fileMeta.originalname || "upload";
   let fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size || 0)/(1024*1024))*100)/100);
 
-  const wavPath = await toCleanWav(inputPath).catch(e => { throw e; });
+  // Transcode to MP3 with adaptive bitrate ≤ 25 MB
+  let audio = null;
+  try {
+    audio = await prepareAudioForWhisper(inputPath);
+  } catch (e) {
+    errorMessage = "Transcode failed: " + (e?.message || e);
+    console.error("❌ " + errorMessage);
+  }
 
   try {
-    minutes = await getAudioMinutes(wavPath);
+    // Use the final compressed file for duration
+    minutes = await getAudioMinutes(audio?.path || inputPath);
     cumulativeMinutes += minutes;
 
-    const verbose = await whisperTranscribeVerbose(wavPath);
+    // Transcribe & translate
+    const verbose = await whisperTranscribeVerbose(audio?.path || inputPath);
     language = verbose.language || "";
     const originalText = verbose.text || "";
 
-    const englishText = (await whisperTranslateToEnglish(wavPath)).text || originalText;
+    const englishText = (await whisperTranslateToEnglish(audio?.path || inputPath)).text || originalText;
     const zhTraditional = await toTraditionalChinese(englishText || originalText);
 
     const mailBody =
@@ -203,8 +231,8 @@ ${zhTraditional}
 == Original language ==
 ${originalText}
 
-(Service account: ${SA_EMAIL})
-(RequestId: ${requestId})`;
+(RequestId: ${requestId})
+(Encoded: ${audio?.kbps || "?"} kbps, ${(audio?.bytes||0/1024/1024).toFixed(2)} MB)`;
 
     await transporter.sendMail({
       from: `"Transcription Service" <${GMAIL_USER}>`,
@@ -216,7 +244,7 @@ ${originalText}
     succeeded = true;
 
   } catch (err) {
-    errorMessage = err?.message || String(err);
+    errorMessage = err?.response?.data?.error?.message || err?.message || String(err);
     console.error("❌ Error processing upload (requestId " + requestId + "):", err);
   }
 
@@ -248,9 +276,16 @@ ${originalText}
     console.error("⚠️ Sheets append failed:", sheetErr?.message || sheetErr);
   }
 
-  // Cleanup
+  // Cleanup temp files
   try { fs.unlinkSync(inputPath); } catch {}
-  try { fs.unlinkSync(wavPath);   } catch {}
+  try {
+    if (audio?.path && fs.existsSync(audio.path)) fs.unlinkSync(audio.path);
+    // also remove any intermediate encodes we may have left
+    ["64k","48k","32k","24k"].forEach(k => {
+      const p = inputPath + "." + k + ".mp3";
+      if (fs.existsSync(p)) try { fs.unlinkSync(p); } catch {}
+    });
+  } catch {}
 }
 
 // ===== Immediate-ack upload =====
