@@ -23,7 +23,7 @@ const GMAIL_USER     = process.env.GMAIL_USER;
 const GMAIL_PASS     = process.env.GMAIL_PASS;
 const SHEET_ID       = process.env.SHEET_ID;
 const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-const LOCAL_TZ       = process.env.LOCAL_TZ || "America/Los_Angeles"; // <— set in Render
+const LOCAL_TZ       = process.env.LOCAL_TZ || "America/Los_Angeles"; // set in Render
 
 function fatal(m){ console.error("❌ " + m); process.exit(1); }
 if (!OPENAI_API_KEY) fatal("Missing OPENAI_API_KEY");
@@ -101,7 +101,7 @@ function secsToSheetMinutes(sec){
   return Math.max(1, Math.ceil((sec||0)/60));
 }
 
-// ===== SHEET HEADER (adds seconds + local time) =====
+// ===== SHEET HEADER (16 columns) =====
 const HEADER = [
   "TimestampUTC","TimestampLocal","Email",
   "Seconds","CumulativeSeconds",
@@ -110,18 +110,19 @@ const HEADER = [
   "ProcessingMs","Succeeded","ErrorMessage","Model","FileType"
 ];
 
+// Write/repair header exactly once
 async function ensureHeader(){
   try {
     const got = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: "Sheet1!A1:Q1",
+      range: "Sheet1!A1:P1",              // 16 columns (A..P)
     });
     const cur = got.data.values?.[0] || [];
     const ok = HEADER.length === cur.length && HEADER.every((h,i)=>h===cur[i]);
     if (!ok) {
       await sheets.spreadsheets.values.update({
         spreadsheetId: SHEET_ID,
-        range: "Sheet1!A1:Q1",
+        range: "Sheet1!A1:P1",
         valueInputOption: "RAW",
         requestBody: { values: [HEADER] }
       });
@@ -129,30 +130,65 @@ async function ensureHeader(){
   } catch(e){ console.error("⚠️ ensureHeader:", e.message || e); }
 }
 
-// Sum prior SUCCESS rows for this email using Seconds if present, else fallback to Minutes*60
+// ===== Header-aware column helpers (handles legacy/new schemas) =====
+function normEmail(x){ return String(x || "").trim().toLowerCase(); }
+function truthy(x){
+  const s = String(x ?? "").trim().toLowerCase();
+  return s === "true" || s === "1" || s === "yes";
+}
+// Build a column-index map from whatever header is present
+async function getColumnMap(){
+  const hdr = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: "Sheet1!A1:Z1",
+  });
+  const row = hdr.data.values?.[0] || [];
+  const map = {};
+  row.forEach((name, idx) => { map[String(name || "").trim()] = idx; });
+  return {
+    idxEmail:           map["Email"],
+    idxSeconds:         map["Seconds"],
+    idxMinutes:         map["Minutes"],
+    idxSucceeded:       map["Succeeded"],
+    // legacy fallback if Succeeded wasn’t where we expect
+    legacySucceededIdx: (map["Succeeded"] ?? 9),
+  };
+}
+
+// Sum prior *successful* rows for this email.
+// Prefer Seconds; fall back to Minutes*60 if Seconds missing.
 async function getPastSecondsForEmail(email){
   try {
+    const cm = await getColumnMap();
     const resp = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: "Sheet1!A2:Q",
+      range: "Sheet1!A2:Z",
       valueRenderOption: "UNFORMATTED_VALUE",
     });
     const rows = resp.data.values || [];
-    const target = (email||"").toLowerCase();
-    let sec = 0;
+    const target = normEmail(email);
+    let totalSeconds = 0;
+
     for (const r of rows){
-      const em = (r[2] || "").toLowerCase();          // Email
-      const succeeded = String(r[12] ?? "").toLowerCase() === "true"; // Succeeded
-      if (em === target && succeeded){
-        const s = Number(r[3]);                        // Seconds
-        if (!Number.isNaN(s)) sec += s;
-        else {
-          const m = Number(r[5]);                      // Minutes fallback
-          if (!Number.isNaN(m)) sec += m*60;
-        }
+      if (!r) continue;
+      const em = normEmail(r[cm.idxEmail]);
+      if (em !== target) continue;
+
+      const succIdx = Number.isInteger(cm.idxSucceeded) ? cm.idxSucceeded : cm.legacySucceededIdx;
+      const succeeded = truthy(r[succIdx]);
+      if (!succeeded) continue;
+
+      const sec = Number(r[cm.idxSeconds]);
+      if (!Number.isNaN(sec) && sec > 0){
+        totalSeconds += sec;
+        continue;
+      }
+      const min = Number(r[cm.idxMinutes]);
+      if (!Number.isNaN(min) && min > 0){
+        totalSeconds += (min * 60);
       }
     }
-    return sec;
+    return totalSeconds;
   } catch (e) {
     console.error("⚠️ getPastSecondsForEmail:", e.message || e);
     return 0;
@@ -297,7 +333,8 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
 
   try {
     // Exact seconds (this job)
-    const jobSeconds = await sumSeconds(parts.length ? parts : [prepared.path || inputPath]);
+    const filesForDuration = (parts && parts.length) ? parts : [prepared?.path || inputPath];
+    const jobSeconds = await sumSeconds(filesForDuration);
     const minutesForSheet = secsToSheetMinutes(jobSeconds);
 
     // Cumulative *seconds* from history → derive cumulative minutes for sheet
@@ -309,9 +346,10 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
 
     // Transcribe & translate
     let originalAll = "";
-    for (let i=0;i<parts.length;i++){
-      if (parts.length>1) addStep(requestId, `Part ${i+1}/${parts.length} …`);
-      const verbose = await openaiTranscribeVerbose(parts[i], requestId);
+    const filesForTranscription = (parts && parts.length) ? parts : [prepared?.path || inputPath];
+    for (let i=0;i<filesForTranscription.length;i++){
+      if (filesForTranscription.length>1) addStep(requestId, `Part ${i+1}/${filesForTranscription.length} …`);
+      const verbose = await openaiTranscribeVerbose(filesForTranscription[i], requestId);
       if (!language) language = verbose.language || "";
       originalAll += (originalAll ? "\n\n" : "") + (verbose.text || "");
     }
@@ -347,8 +385,9 @@ ${originalAll}
 此外，若您還有其他語音檔案需要轉換，歡迎隨時再次使用我們的服務。我們的官網是 www.dottlight.com.
 
 本次使用費用 (已為您減免)：$${costThis.toFixed(2)}
+
 （請求編號：${requestId}）
-（編碼參數：${prepared?.kbps || "?"} kbps，${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts.length>1?`，共 ${parts.length} 個分段`:''}）`;
+（編碼參數：${prepared?.kbps || "?"} kbps，${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts && parts.length>1?`，共 ${parts.length} 個分段`:''}）`;
 
     addStep(requestId, "Sending email …");
     await mailer.sendMail({
@@ -359,7 +398,7 @@ ${originalAll}
     });
     addStep(requestId, "Email sent.");
 
-    // Sheet row (now with seconds + local timestamp)
+    // Sheet row (seconds + local timestamp) — NOTE: range A:P (16 cols)
     try {
       await ensureHeader();
       const row = [
@@ -369,7 +408,7 @@ ${originalAll}
         jobSeconds,                          // Seconds
         cumulativeSeconds,                   // CumulativeSeconds
         minutesForSheet,                     // Minutes (rounded-up, billing)
-        cumulativeMinutesForSheet,           // CumulativeMinutes (rounded-up from seconds)
+        cumulativeMinutesForSheet,           // CumulativeMinutes (rounded-up)
         fileName,
         fileSizeMB,
         language || "",
@@ -382,7 +421,7 @@ ${originalAll}
       ];
       await sheets.spreadsheets.values.append({
         spreadsheetId: SHEET_ID,
-        range: "Sheet1!A:Q",
+        range: "Sheet1!A:P",
         valueInputOption: "RAW",
         requestBody: { values: [row] },
       });
@@ -398,14 +437,15 @@ ${originalAll}
     try {
       await ensureHeader();
       const localStamp = fmtLocalStamp(new Date());
+      const pastSeconds = await getPastSecondsForEmail(email);
       const row = [
         new Date().toISOString(),
         localStamp,
         email,
         0,
-        await getPastSecondsForEmail(email),
+        pastSeconds,
         0,
-        secsToSheetMinutes(await getPastSecondsForEmail(email)),
+        secsToSheetMinutes(pastSeconds),
         fileName,
         fileSizeMB || 0,
         "",
@@ -418,7 +458,7 @@ ${originalAll}
       ];
       await sheets.spreadsheets.values.append({
         spreadsheetId: SHEET_ID,
-        range: "Sheet1!A:Q",
+        range: "Sheet1!A:P",
         valueInputOption: "RAW",
         requestBody: { values: [row] },
       });
