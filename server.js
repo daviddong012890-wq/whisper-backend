@@ -392,7 +392,7 @@ ${originalAll}
 
 如果您認為我們的服務對您有所幫助並願意支持我們，您的贊助將協助我們持續優化系統與服務。您可透過 Zelle 轉帳至 626-436-4199，收款方為 Dottlight, Inc.
 
-此外，若您還有其他語音檔案需要轉換，歡迎隨時再次使用我們的服務。我們的官網是 www.dottlight.com.
+此外，若您還有其他檔案需要轉換，歡迎隨時再次使用我們的服務。我們的官網是 www.dottlight.com.
 
 本次使用費用 (已為您減免)：$${costThis.toFixed(2)}
 
@@ -405,7 +405,7 @@ ${originalAll}
     await mailer.sendMail({
       from: `"逐字稿產生器" <${GMAIL_USER}>`,
       to: email,
-      subject: "您的轉寫結果（原文與繁體中文）",
+      subject: "您的逐字稿（原文與繁體中文）",
       text: mailBody,
       attachments: [
         {
