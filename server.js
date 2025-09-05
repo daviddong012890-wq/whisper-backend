@@ -371,35 +371,36 @@ ${originalAll}
 
     // Email (Chinese only + original) with timestamp + message + cost + attachment note
     const mailBody =
-`轉寫已完成
-${localStamp}
+`轉寫已完成 ${localStamp}
 
 本次上傳時長：${fmtZhSec(jobSeconds)}
 
 您的逐字稿旅程
 已累積時長：${fmtZhSec(cumulativeSeconds)}
 
-＝＝ 中文（繁體） ＝＝
+＝＝ 中文 ＝＝
 ${zhTraditional}
 
 ＝＝ 原文 ＝＝
 ${originalAll}
 
 ＝＝ 頁尾 ＝＝
-感謝您使用我們的逐字稿產生器。請注意，本服務為機器自動化翻譯，其內容僅供參考，我們不保證其百分之百的正確性、完整性或即時性。逐字稿可能包含錯誤、遺漏或雜訊。您的影片音訊均受到嚴格保護，在處理完畢後，您的原始檔案會立即被刪除，以確保您的隱私。
+感謝您使用本系統的逐字服務。
 
-本服務的正式使用費用為每 100 分鐘 $5 美元，但目前特別為美國慈濟的用戶提供免費使用。若您在使用上有任何問題，歡迎隨時聯絡 David Lee 電話/簡訊：626-436-4199
+本服務由機器自動化翻譯完成，內容僅供參考，無法保證百分之百正確、完整或即時，文字中或許存在錯誤、遺漏或雜訊（例如人名同音異寫）。敬請用戶依需求自行修正與調整。您的影片與音訊將受到嚴格保護，處理完成後，原始檔案即刻刪除，不做任何儲存。
 
-如果您認為我們的系統對您有所幫助並願意支持我們，您的贊助將協助我們持續優化服務。您可透過 Zelle 轉帳至 626-436-4199，收款方為 Dottlight, Inc.
+目前，本服務特別為美國慈濟用戶提供免費使用。若在使用過程中有任何疑問，歡迎隨時聯絡 David Lee（電話/簡訊：626-436-4199）
 
-此外，若您還有其他影片音訊檔案需要轉換，歡迎隨時再次使用我們的產生器：官網 https://www.dottlight.com/
+若您覺得系統對您有幫助並願意支持我們，本服務的正式使用費用為每 100 分鐘 $5 美元。您可透過 Zelle 轉帳至 626-436-4199（收款方：Dottlight, Inc.）。您的贊助將協助我們持續優化系統，並分擔服務器與維護成本。
 
-本次使用費用 (已為您減免)：$${costThis.toFixed(2)}
+若您需要再次使用本服務，請直接前往我們的官網：https://www.dottlight.com/
 
-附件為本次逐字稿的 .txt 文件，方便您下載或複製到其他軟體使用。
+附件為逐字稿的 .txt 文件，方便您下載或複製到其他軟體使用。
 
 （服務單號：${requestId}）
-（編碼參數：${prepared?.kbps || "?"} kbps，${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts && parts.length>1?`，共 ${parts.length} 個分段`:''}）`;
+（編碼參數：${prepared?.kbps || "?"} kbps，${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts && parts.length>1?`，共 ${parts.length} 個分段`:''}）
+
+本次使用費用 (已為您減免)：$${costThis.toFixed(2)}`;
 
     addStep(requestId, "Sending email …");
     await mailer.sendMail({
