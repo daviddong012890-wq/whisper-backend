@@ -375,9 +375,6 @@ ${originalAll}
 
 本次上傳時長：${fmtZhSec(jobSeconds)}
 
-您的逐字稿旅程
-已累積時長：${fmtZhSec(cumulativeSeconds)}
-
 ＝＝ 中文 ＝＝
 ${zhTraditional}
 
@@ -400,7 +397,9 @@ ${originalAll}
 （服務單號：${requestId}）
 （編碼參數：${prepared?.kbps || "?"} kbps，${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts && parts.length>1?`，共 ${parts.length} 個分段`:''}）
 
-本次使用費用 (已為您減免)：$${costThis.toFixed(2)}`;
+您的逐字稿旅程
+已累積時長：${fmtZhSec(cumulativeSeconds)}
+本次使用費用 (已為您減免)：${fmtZhSec(jobSeconds)} $${costThis.toFixed(2)}`;
 
     addStep(requestId, "Sending email …");
     await mailer.sendMail({
