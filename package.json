@@ -3,11 +3,16 @@
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18 <=22" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18 <23"
+  },
   "dependencies": {
     "axios": "^1.7.7",
     "cors": "^2.8.5",
+    "docx": "^8.5.0",
     "express": "^4.19.2",
     "ffmpeg-static": "^5.2.0",
     "fluent-ffmpeg": "^2.1.2",
@@ -15,7 +20,6 @@
     "googleapis": "^131.0.0",
     "multer": "^1.4.5-lts.1",
     "nodemailer": "^6.9.14",
-    "docx": "^8.5.0",        // ← add
-    "pdfkit": "^0.15.0"      // ← add
+    "pdfkit": "^0.15.0"
   }
 }
