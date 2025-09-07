@@ -10,7 +10,7 @@ import FormData from "form-data";
 import nodemailer from "nodemailer";
 import { google } from "googleapis";
 import crypto from "crypto";
-// 👉 NEW: libraries for Word/PDF
+// Word/PDF
 import { Document, Packer, Paragraph } from "docx";
 import PDFDocument from "pdfkit";
 
@@ -19,7 +19,7 @@ const CONSUME_URL = process.env.CONSUME_URL || "";           // e.g. https://voi
 const WORKER_SHARED_KEY = process.env.WORKER_SHARED_KEY || "";// same value as in config.php
 
 async function consume(payload) {
-  if (!CONSUME_URL) return; // silently skip if not configured
+  if (!CONSUME_URL) return;
   try {
     await axios.post(CONSUME_URL, payload, {
       headers: WORKER_SHARED_KEY ? { "X-Worker-Key": WORKER_SHARED_KEY } : {},
@@ -43,7 +43,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GMAIL_USER     = process.env.GMAIL_USER;
 const GMAIL_PASS     = process.env.GMAIL_PASS;
 const SHEET_ID       = process.env.SHEET_ID;
-const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS; // env var path to service account json
 const LOCAL_TZ       = process.env.LOCAL_TZ || "America/Los_Angeles";
 
 function fatal(m){ console.error("❌ " + m); process.exit(1); }
@@ -340,7 +340,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
 
     addStep(requestId, `Duration this job: ${jobSeconds}s; cumulative: ${cumulativeSeconds}s.`);
 
-    // transcribe (+ optional translate)
+    // transcribe + translate
     let originalAll = "";
     const filesForTranscription = (parts && parts.length) ? parts : [prepared?.path || inputPath];
     for (let i=0;i<filesForTranscription.length;i++){
@@ -351,7 +351,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     }
     const zhTraditional = await zhTwFromOriginalFaithful(originalAll, requestId);
 
-    // email attachment contents (TXT always)
+    // email attachments
     const localStamp = fmtLocalStamp(new Date());
     const attachmentText = `＝＝ 中文（繁體） ＝＝
 ${zhTraditional}
@@ -360,10 +360,11 @@ ${zhTraditional}
 ${originalAll}
 `;
     const safeBase = (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
-    const attachmentName = `${safeBase}-${requestId}.txt`;
+    const txtName  = `${safeBase}-${requestId}.txt`;
+    const docxName = `${safeBase}-${requestId}.docx`;
+    const pdfName  = `${safeBase}-${requestId}.pdf`;
 
-    // 👉 NEW: also build DOCX + PDF
-    // --- DOCX ---
+    // DOCX
     const doc = new Document({
       sections: [{
         children: [
@@ -377,7 +378,7 @@ ${originalAll}
     });
     const docxBuffer = await Packer.toBuffer(doc);
 
-    // --- PDF ---
+    // PDF
     const pdfDoc = new PDFDocument({ margin: 36 });
     const pdfChunks = [];
     pdfDoc.on("data", chunk => pdfChunks.push(chunk));
@@ -401,24 +402,14 @@ ${originalAll}
       subject: "您的逐字稿（原文與繁體中文）",
       text: `轉寫已完成 ${localStamp}\n\n本次上傳時長（秒）：${jobSeconds}\n\n（服務單號：${requestId}）`,
       attachments: [
-        {
-          filename: attachmentName,
-          content: attachmentText,
-          contentType: "text/plain; charset=utf-8"
-        },
-        {
-          filename: attachmentName.replace(".txt", ".docx"),
-          content: docxBuffer
-        },
-        {
-          filename: attachmentName.replace(".txt", ".pdf"),
-          content: pdfBuffer
-        }
+        { filename: txtName,  content: attachmentText, contentType: "text/plain; charset=utf-8" },
+        { filename: docxName, content: docxBuffer,    contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
+        { filename: pdfName,  content: pdfBuffer,     contentType: "application/pdf" }
       ]
     });
     addStep(requestId, "Email sent.");
 
-    // sheet
+    // sheet append
     try {
       await ensureHeader();
       const row = [
@@ -450,7 +441,7 @@ ${originalAll}
       addStep(requestId, "⚠️ Sheet append failed: " + (e?.message || e));
     }
 
-    // *** TELL PHP the real numbers ***
+    // tell PHP actual usage
     await consume({
       event: "transcription.finished",
       status: "succeeded",
@@ -460,7 +451,7 @@ ${originalAll}
       job_id: jobId || "",
       token: token || "",
       duration_sec: jobSeconds,
-      charged_seconds: jobSeconds,  // your billing = real seconds
+      charged_seconds: jobSeconds,
       language: language || "",
       finished_at: new Date().toISOString()
     });
@@ -469,7 +460,6 @@ ${originalAll}
     const eMsg = err?.message || "Processing error";
     addStep(requestId, "❌ " + eMsg);
 
-    // tell PHP that it failed (so it can refund the reservation)
     await consume({
       event: "transcription.finished",
       status: "failed",
