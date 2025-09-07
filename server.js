@@ -1,3 +1,4 @@
+// ===== Imports =====
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -11,6 +12,7 @@ import nodemailer from "nodemailer";
 import { google } from "googleapis";
 import crypto from "crypto";
 
+// ===== App / Upload setup =====
 const app = express();
 app.use(cors({ origin: "*" }));
 app.options("*", cors());
@@ -18,12 +20,16 @@ const upload = multer({ dest: "/tmp" });
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
 // ===== ENV =====
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const GMAIL_USER     = process.env.GMAIL_USER;
-const GMAIL_PASS     = process.env.GMAIL_PASS;
-const SHEET_ID       = process.env.SHEET_ID;
-const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-const LOCAL_TZ       = process.env.LOCAL_TZ || "America/Los_Angeles"; // set in Render
+const OPENAI_API_KEY     = process.env.OPENAI_API_KEY;
+const GMAIL_USER         = process.env.GMAIL_USER;
+const GMAIL_PASS         = process.env.GMAIL_PASS;
+const SHEET_ID           = process.env.SHEET_ID;
+const GOOGLE_KEYFILE     = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+const LOCAL_TZ           = process.env.LOCAL_TZ || "America/Los_Angeles";
+
+// webhook → your PHP site
+const CONSUME_URL        = process.env.CONSUME_URL || "";           // e.g. https://voixl.com/worker-consume.php
+const WORKER_SHARED_KEY  = process.env.WORKER_SHARED_KEY || "";      // same value as in PHP config.php
 
 function fatal(m){ console.error("❌ " + m); process.exit(1); }
 if (!OPENAI_API_KEY) fatal("Missing OPENAI_API_KEY");
@@ -41,19 +47,32 @@ function logAxiosError(prefix, err) {
   console.error(`${prefix}${status ? " ["+status+"]" : ""}${code ? " ("+code+")" : ""}: ${msg}`);
 }
 
-// ===== GOOGLE =====
+// ===== Webhook helper (PHP callback) =====
+async function consume(payload) {
+  if (!CONSUME_URL) return; // noop if not configured
+  try {
+    await axios.post(CONSUME_URL, payload, {
+      headers: WORKER_SHARED_KEY ? { "X-Worker-Key": WORKER_SHARED_KEY } : {}
+    });
+  } catch (e) {
+    console.error("consume() error:", e?.message || e);
+  }
+}
+
+// ===== GOOGLE (Sheets) =====
 const auth = new google.auth.GoogleAuth({
   keyFile: GOOGLE_KEYFILE,
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
 const sheets = google.sheets({ version: "v4", auth });
 
+// ===== Mailer (Gmail) =====
 const mailer = nodemailer.createTransport({
   service: "gmail",
   auth: { user: GMAIL_USER, pass: GMAIL_PASS }
 });
 
-// ===== JOB TRACKING =====
+// ===== JOB TRACKING (for /status) =====
 const jobs = new Map();
 function addStep(id, text){
   const cur = jobs.get(id) || { status:"queued", steps:[], error:null, metrics:{} };
@@ -110,12 +129,12 @@ const HEADER = [
   "ProcessingMs","Succeeded","ErrorMessage","Model","FileType"
 ];
 
-// Write/repair header exactly once
+// Ensure header exists
 async function ensureHeader(){
   try {
     const got = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: "Sheet1!A1:P1",              // 16 columns (A..P)
+      range: "Sheet1!A1:P1",
     });
     const cur = got.data.values?.[0] || [];
     const ok = HEADER.length === cur.length && HEADER.every((h,i)=>h===cur[i]);
@@ -130,7 +149,7 @@ async function ensureHeader(){
   } catch(e){ console.error("⚠️ ensureHeader:", e.message || e); }
 }
 
-// ===== Header-aware column helpers (handles legacy/new schemas) =====
+// Header-aware helpers (works with legacy cols)
 function normEmail(x){ return String(x || "").trim().toLowerCase(); }
 function truthy(x){
   const s = String(x ?? "").trim().toLowerCase();
@@ -154,7 +173,6 @@ async function getColumnMap(){
 }
 
 // Sum prior *successful* rows for this email.
-// Prefer Seconds; fall back to Minutes*60 if Seconds missing.
 async function getPastSecondsForEmail(email){
   try {
     const cm = await getColumnMap();
@@ -310,7 +328,7 @@ async function zhTwFromOriginalFaithful(originalText, requestId){
 }
 
 // ===== PROCESSOR =====
-async function processJob({ email, inputPath, fileMeta, requestId }){
+async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }){
   const started = Date.now();
   setJob(requestId, { status:"processing", metrics:{ started } });
   addStep(requestId, `Accepted: ${fileMeta.originalname} (${(fileMeta.size/1024/1024).toFixed(2)} MB)`);
@@ -321,22 +339,20 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
   const fileName = fileMeta.originalname || "upload";
   const fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size||0)/(1024*1024))*100)/100);
 
-  // 1) Prepare / split
   let prepared, parts=[];
+  let jobSeconds = 0;
+
   try {
+    // Prepare/split
     prepared = await prepareMp3UnderLimit(inputPath, requestId);
     parts = await splitIfNeeded(prepared.path, requestId);
-  } catch (e) {
-    addStep(requestId, "❌ Transcode failed: " + (e?.message || e));
-  }
 
-  try {
     // Exact seconds (this job)
     const filesForDuration = (parts && parts.length) ? parts : [prepared?.path || inputPath];
-    const jobSeconds = await sumSeconds(filesForDuration);
+    jobSeconds = await sumSeconds(filesForDuration);
     const minutesForSheet = secsToSheetMinutes(jobSeconds);
 
-    // Cumulative *seconds* from history → derive cumulative minutes for sheet
+    // Cumulative seconds from history
     const pastSeconds = await getPastSecondsForEmail(email);
     const cumulativeSeconds = pastSeconds + jobSeconds;
     const cumulativeMinutesForSheet = secsToSheetMinutes(cumulativeSeconds);
@@ -354,11 +370,10 @@ async function processJob({ email, inputPath, fileMeta, requestId }){
     }
     const zhTraditional = await zhTwFromOriginalFaithful(originalAll, requestId);
 
-    // Cost estimate ($5 / 100 min = $0.05 / min)
+    // Email body + attachment
     const costThis = (jobSeconds/60 * 0.05);
     const localStamp = fmtLocalStamp(new Date());
 
-    // Build .txt attachment content (UTF-8)
     const attachmentText =
 `＝＝ 中文（繁體） ＝＝
 ${zhTraditional}
@@ -369,7 +384,6 @@ ${originalAll}
     const safeBase = (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
     const attachmentName = `${safeBase}-${requestId}.txt`;
 
-    // Email (Chinese only + original) with timestamp + message + cost + attachment note
     const mailBody =
 `轉寫已完成 ${localStamp}
 
@@ -383,23 +397,8 @@ ${originalAll}
 
 ＝＝ 頁尾 ＝＝
 感謝您使用本系統的逐字服務。
-
-本服務由機器自動化翻譯完成，內容僅供參考，無法保證百分之百正確、完整或即時，文字中或許存在錯誤、遺漏或雜訊（例如人名同音異寫）。敬請用戶依需求自行修正與調整。您的影片與音訊將受到嚴格保護，處理完成後，原始檔案即刻刪除，不做任何儲存。
-
-目前，本服務特別為美國慈濟用戶提供免費使用。若在使用過程中有任何疑問，歡迎隨時聯絡 David Lee（電話/簡訊：626-436-4199）
-
-若您覺得系統對您有幫助並願意支持我們，本服務的正式使用費用為每 100 分鐘 $5 美元。您可透過 Zelle 轉帳至 626-436-4199（收款方：Dottlight, Inc.）。您的贊助將協助我們持續優化系統，並分擔服務器與維護成本。
-
-若您需要再次使用本服務，請直接前往我們的官網：https://www.dottlight.com/
-
-附件為逐字稿的 .txt 文件，方便您下載或複製到其他軟體使用。
-
 （服務單號：${requestId}）
-（編碼參數：${prepared?.kbps || "?"} kbps，${(prepared?.bytes||0/1024/1024).toFixed(2)} MB${parts && parts.length>1?`，共 ${parts.length} 個分段`:''}）
-
-您的逐字稿旅程
-已累積時長：${fmtZhSec(cumulativeSeconds)}
-本次使用費用 (已為您減免)：${fmtZhSec(jobSeconds)} $${costThis.toFixed(2)}`;
+`;
 
     addStep(requestId, "Sending email …");
     await mailer.sendMail({
@@ -407,27 +406,21 @@ ${originalAll}
       to: email,
       subject: "您的逐字稿（原文與繁體中文）",
       text: mailBody,
-      attachments: [
-        {
-          filename: attachmentName,
-          content: attachmentText,          // UTF-8 text
-          contentType: "text/plain; charset=utf-8"
-        }
-      ]
+      attachments: [{ filename: attachmentName, content: attachmentText, contentType: "text/plain; charset=utf-8" }]
     });
     addStep(requestId, "Email sent.");
 
-    // Sheet row (seconds + local timestamp) — NOTE: range A:P (16 cols)
+    // Append to Sheet
     try {
       await ensureHeader();
       const row = [
-        new Date().toISOString(),            // TimestampUTC
-        localStamp,                          // TimestampLocal
+        new Date().toISOString(),
+        localStamp,
         email,
-        jobSeconds,                          // Seconds
-        cumulativeSeconds,                   // CumulativeSeconds
-        minutesForSheet,                     // Minutes (rounded-up, billing)
-        cumulativeMinutesForSheet,           // CumulativeMinutes (rounded-up)
+        jobSeconds,
+        cumulativeSeconds,
+        minutesForSheet,
+        cumulativeMinutesForSheet,
         fileName,
         fileSizeMB,
         language || "",
@@ -449,10 +442,23 @@ ${originalAll}
       addStep(requestId, "⚠️ Sheet append failed: " + (e?.message || e));
     }
 
+    // SUCCESS webhook → PHP
+    await consume({
+      email,
+      filename: fileName,
+      filesize_bytes: fileMeta.size || 0,
+      duration_sec: jobSeconds,
+      succeeded: true,
+      request_id: requestId,
+      job_id: jobId || 0,
+      token: token || ""
+    });
+
   } catch (err) {
     const eMsg = err?.message || "Processing error";
     addStep(requestId, "❌ " + eMsg);
-    // failure row
+
+    // failure row in Sheet (best-effort)
     try {
       await ensureHeader();
       const localStamp = fmtLocalStamp(new Date());
@@ -482,9 +488,22 @@ ${originalAll}
         requestBody: { values: [row] },
       });
     } catch {}
+
+    // FAILURE webhook → PHP
+    await consume({
+      email,
+      filename: fileName,
+      filesize_bytes: fileMeta.size || 0,
+      duration_sec: 0,
+      succeeded: false,
+      request_id: requestId,
+      job_id: jobId || 0,
+      token: token || "",
+      error: eMsg
+    });
   }
 
-  // Cleanup
+  // Cleanup temp files
   try { fs.unlinkSync(inputPath); } catch {}
   try {
     if (fs.existsSync(inputPath + ".clean.wav")) fs.unlinkSync(inputPath + ".clean.wav");
@@ -510,18 +529,29 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     if (!email) return res.status(400).json({ error: "Email is required" });
     if (!req.file) return res.status(400).json({ error: "File is required" });
 
+    // These are optionally sent by your PHP form; OK if blank
+    const jobId = req.body.job_id ? String(req.body.job_id) : "";
+    const token = req.body.token ? String(req.body.token) : "";
+
     const requestId = crypto.randomUUID();
     setJob(requestId, { status:"accepted", steps:[], error:null, metrics:{} });
     addStep(requestId, "Upload accepted.");
 
+    // respond immediately
     res.status(202).json({ success:true, accepted:true, requestId });
 
-    setImmediate(()=>processJob({ email, inputPath: req.file.path, fileMeta: req.file, requestId })
-      .catch(e=>{
-        addStep(requestId, "❌ Background crash: " + (e?.message || e));
-        setJob(requestId, { status:"error", error: e?.message || String(e) });
-      })
-    );
+    // background processing
+    setImmediate(()=>processJob({
+      email,
+      inputPath: req.file.path,
+      fileMeta: req.file,
+      requestId,
+      jobId,
+      token
+    }).catch(e=>{
+      addStep(requestId, "❌ Background crash: " + (e?.message || e));
+      setJob(requestId, { status:"error", error: e?.message || String(e) });
+    }));
   } catch (err) {
     console.error("❌ accept error:", err?.message || err);
     res.status(500).json({ error: "Processing failed at accept stage" });
