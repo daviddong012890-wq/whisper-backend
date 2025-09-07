@@ -23,7 +23,7 @@ async function consume(payload) {
   try {
     await axios.post(CONSUME_URL, payload, {
       headers: WORKER_SHARED_KEY ? { "X-Worker-Key": WORKER_SHARED_KEY } : {},
-      timeout: 10000,
+      timeout: 10000
     });
     console.log("→ consume() POST ok");
   } catch (e) {
@@ -43,7 +43,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GMAIL_USER     = process.env.GMAIL_USER;
 const GMAIL_PASS     = process.env.GMAIL_PASS;
 const SHEET_ID       = process.env.SHEET_ID;
-const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS; // env var path to service account json
+const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATIONS_CREDENTIALS || process.env.GOOGLE_APPLICATION_CREDENTIALS;
 const LOCAL_TZ       = process.env.LOCAL_TZ || "America/Los_Angeles";
 
 function fatal(m){ console.error("❌ " + m); process.exit(1); }
@@ -59,12 +59,12 @@ function logAxiosError(prefix, err) {
   const status = err?.response?.status;
   const code   = err?.code;
   const msg = err?.response?.data?.error?.message || err?.message || String(err);
-  console.error(`${prefix}${status ? " ["+status+"]" : ""}${code ? " ("+code+")" : ""}: ${msg}`);
+  console.error(`${prefix}${status ? " [${status}]" : ""}${code ? " (${code})" : ""}: ${msg}`);
 }
 
 const auth = new google.auth.GoogleAuth({
   keyFile: GOOGLE_KEYFILE,
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  scopes: ["https://www.googleapis.com/auth/spreadsheets"]
 });
 const sheets = google.sheets({ version: "v4", auth });
 
@@ -126,14 +126,16 @@ const HEADER = [
 async function ensureHeader(){
   try {
     const got = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID, range: "Sheet1!A1:P1",
+      spreadsheetId: SHEET_ID, range: "Sheet1!A1:P1"
     });
     const cur = got.data.values?.[0] || [];
     const ok = HEADER.length === cur.length && HEADER.every((h,i)=>h===cur[i]);
     if (!ok) {
       await sheets.spreadsheets.values.update({
-        spreadsheetId: SHEET_ID, range: "Sheet1!A1:P1",
-        valueInputOption: "RAW", requestBody: { values: [HEADER] }
+        spreadsheetId: SHEET_ID,
+        range: "Sheet1!A1:P1",
+        valueInputOption: "RAW",
+        requestBody: { values: [HEADER] }
       });
     }
   } catch(e){ console.error("⚠️ ensureHeader:", e.message || e); }
@@ -146,7 +148,7 @@ function truthy(x){
 }
 async function getColumnMap(){
   const hdr = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: "Sheet1!A1:Z1",
+    spreadsheetId: SHEET_ID, range: "Sheet1!A1:Z1"
   });
   const row = hdr.data.values?.[0] || [];
   const map = {};
@@ -156,7 +158,7 @@ async function getColumnMap(){
     idxSeconds:   map["Seconds"],
     idxMinutes:   map["Minutes"],
     idxSucceeded: map["Succeeded"],
-    legacySucceededIdx: (map["Succeeded"] ?? 9),
+    legacySucceededIdx: (map["Succeeded"] ?? 9)
   };
 }
 async function getPastSecondsForEmail(email){
@@ -164,21 +166,18 @@ async function getPastSecondsForEmail(email){
     const cm = await getColumnMap();
     const resp = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID, range: "Sheet1!A2:Z",
-      valueRenderOption: "UNFORMATTED_VALUE",
+      valueRenderOption: "UNFORMATTED_VALUE"
     });
     const rows = resp.data.values || [];
     const target = normEmail(email);
     let totalSeconds = 0;
-
     for (const r of rows){
       if (!r) continue;
       const em = normEmail(r[cm.idxEmail]);
       if (em !== target) continue;
-
       const succIdx = Number.isInteger(cm.idxSucceeded) ? cm.idxSucceeded : cm.legacySucceededIdx;
       const succeeded = truthy(r[succIdx]);
       if (!succeeded) continue;
-
       const sec = Number(r[cm.idxSeconds]);
       if (!Number.isNaN(sec) && sec > 0){ totalSeconds += sec; continue; }
       const min = Number(r[cm.idxMinutes]);
@@ -230,7 +229,6 @@ async function prepareMp3UnderLimit(inMediaPath, requestId){
   const tmpWav = inMediaPath + ".clean.wav";
   addStep(requestId, "Extracting audio → WAV …");
   await extractToWav(inMediaPath, tmpWav);
-
   const ladder = [64,48,32,24];
   for (const kb of ladder){
     const out = inMediaPath + `.${kb}k.mp3`;
@@ -271,7 +269,7 @@ async function openaiTranscribeVerbose(audioPath, requestId){
     fd.append("temperature", "0");
     const r = await axios.post("https://api.openai.com/v1/audio/transcriptions", fd, {
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
-      maxBodyLength: Infinity,
+      maxBodyLength: Infinity
     });
     addStep(requestId, "Transcription done.");
     return r.data;
@@ -372,7 +370,7 @@ ${originalAll}
           ...String(zhTraditional || "").split("\n").map(line => new Paragraph(line)),
           new Paragraph(""),
           new Paragraph("＝＝ 原文 ＝＝"),
-          ...String(originalAll || "").split("\n").map(line => new Paragraph(line)),
+          ...String(originalAll || "").split("\n").map(line => new Paragraph(line))
         ]
       }]
     });
@@ -434,7 +432,7 @@ ${originalAll}
         spreadsheetId: SHEET_ID,
         range: "Sheet1!A:P",
         valueInputOption: "RAW",
-        requestBody: { values: [row] },
+        requestBody: { values: [row] }
       });
       addStep(requestId, "Sheet updated.");
     } catch (e) {
