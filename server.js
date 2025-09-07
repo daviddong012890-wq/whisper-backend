@@ -10,13 +10,12 @@ import FormData from "form-data";
 import nodemailer from "nodemailer";
 import { google } from "googleapis";
 import crypto from "crypto";
-// Word/PDF
+// DOCX only
 import { Document, Packer, Paragraph } from "docx";
-import PDFDocument from "pdfkit";
 
 // ---------- notify PHP (worker-consume.php) ----------
-const CONSUME_URL = process.env.CONSUME_URL || "";           // e.g. https://voixl.com/worker-consume.php
-const WORKER_SHARED_KEY = process.env.WORKER_SHARED_KEY || "";// same value as in config.php
+const CONSUME_URL = process.env.CONSUME_URL || "";
+const WORKER_SHARED_KEY = process.env.WORKER_SHARED_KEY || "";
 
 async function consume(payload) {
   if (!CONSUME_URL) return;
@@ -349,7 +348,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     }
     const zhTraditional = await zhTwFromOriginalFaithful(originalAll, requestId);
 
-    // email attachments
+    // email attachments: TXT + DOCX only
     const localStamp = fmtLocalStamp(new Date());
     const attachmentText = `＝＝ 中文（繁體） ＝＝
 ${zhTraditional}
@@ -360,7 +359,6 @@ ${originalAll}
     const safeBase = (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
     const txtName  = `${safeBase}-${requestId}.txt`;
     const docxName = `${safeBase}-${requestId}.docx`;
-    const pdfName  = `${safeBase}-${requestId}.pdf`;
 
     // DOCX
     const doc = new Document({
@@ -376,23 +374,6 @@ ${originalAll}
     });
     const docxBuffer = await Packer.toBuffer(doc);
 
-    // PDF
-    const pdfDoc = new PDFDocument({ margin: 36 });
-    const pdfChunks = [];
-    pdfDoc.on("data", chunk => pdfChunks.push(chunk));
-    pdfDoc.fontSize(14)
-      .text("＝＝ 中文（繁體） ＝＝\n")
-      .moveDown(0.2)
-      .fontSize(12).text(zhTraditional || "")
-      .moveDown()
-      .fontSize(14).text("＝＝ 原文 ＝＝\n")
-      .moveDown(0.2)
-      .fontSize(12).text(originalAll || "");
-    pdfDoc.end();
-    const pdfBuffer = await new Promise(resolve => {
-      pdfDoc.on("end", () => resolve(Buffer.concat(pdfChunks)));
-    });
-
     addStep(requestId, "Sending email …");
     await mailer.sendMail({
       from: `"逐字稿產生器" <${GMAIL_USER}>`,
@@ -401,8 +382,7 @@ ${originalAll}
       text: `轉寫已完成 ${localStamp}\n\n本次上傳時長（秒）：${jobSeconds}\n\n（服務單號：${requestId}）`,
       attachments: [
         { filename: txtName,  content: attachmentText, contentType: "text/plain; charset=utf-8" },
-        { filename: docxName, content: docxBuffer,    contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
-        { filename: pdfName,  content: pdfBuffer,     contentType: "application/pdf" }
+        { filename: docxName, content: docxBuffer,    contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
       ]
     });
     addStep(requestId, "Email sent.");
