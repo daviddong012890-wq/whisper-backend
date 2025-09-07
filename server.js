@@ -1,4 +1,3 @@
-// ===== Imports =====
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -12,34 +11,47 @@ import nodemailer from "nodemailer";
 import { google } from "googleapis";
 import crypto from "crypto";
 
-// ===== App / Upload setup =====
+// ---------- notify PHP (worker-consume.php) ----------
+const CONSUME_URL = process.env.CONSUME_URL || "";           // e.g. https://voixl.com/worker-consume.php
+const WORKER_SHARED_KEY = process.env.WORKER_SHARED_KEY || "";// same value as in config.php
+
+async function consume(payload) {
+  if (!CONSUME_URL) return; // silently skip if not configured
+  try {
+    await axios.post(CONSUME_URL, payload, {
+      headers: WORKER_SHARED_KEY ? { "X-Worker-Key": WORKER_SHARED_KEY } : {},
+      timeout: 10000,
+    });
+    console.log("→ consume() POST ok");
+  } catch (e) {
+    console.error("consume() error:", e?.response?.status || "", e?.message || e);
+  }
+}
+
+// ---------- app / setup ----------
 const app = express();
 app.use(cors({ origin: "*" }));
 app.options("*", cors());
 const upload = multer({ dest: "/tmp" });
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
-// ===== ENV =====
-const OPENAI_API_KEY     = process.env.OPENAI_API_KEY;
-const GMAIL_USER         = process.env.GMAIL_USER;
-const GMAIL_PASS         = process.env.GMAIL_PASS;
-const SHEET_ID           = process.env.SHEET_ID;
-const GOOGLE_KEYFILE     = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-const LOCAL_TZ           = process.env.LOCAL_TZ || "America/Los_Angeles";
-
-// webhook → your PHP site
-const CONSUME_URL        = process.env.CONSUME_URL || "";           // e.g. https://voixl.com/worker-consume.php
-const WORKER_SHARED_KEY  = process.env.WORKER_SHARED_KEY || "";      // same value as in PHP config.php
+// ---------- env checks ----------
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const GMAIL_USER     = process.env.GMAIL_USER;
+const GMAIL_PASS     = process.env.GMAIL_PASS;
+const SHEET_ID       = process.env.SHEET_ID;
+const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+const LOCAL_TZ       = process.env.LOCAL_TZ || "America/Los_Angeles";
 
 function fatal(m){ console.error("❌ " + m); process.exit(1); }
 if (!OPENAI_API_KEY) fatal("Missing OPENAI_API_KEY");
 if (!GMAIL_USER || !GMAIL_PASS) fatal("Missing GMAIL_USER or GMAIL_PASS");
 if (!SHEET_ID) fatal("Missing SHEET_ID");
-if (!GOOGLE_KEYFILE) fatal("Missing GOOGLE_APPLICATION_CREDENTIALS");
+if (!GOOGLE_KEYFILE) fatal("Missing GOOGLE_APPLICATIONS_CREDENTIALS");
 if (!fs.existsSync(GOOGLE_KEYFILE)) fatal(`Key not found at ${GOOGLE_KEYFILE}`);
 try { JSON.parse(fs.readFileSync(GOOGLE_KEYFILE,"utf8")); } catch(e){ fatal("Bad service-account JSON: " + e.message); }
 
-// ===== SAFE LOGGING =====
+// ---------- helpers ----------
 function logAxiosError(prefix, err) {
   const status = err?.response?.status;
   const code   = err?.code;
@@ -47,32 +59,18 @@ function logAxiosError(prefix, err) {
   console.error(`${prefix}${status ? " ["+status+"]" : ""}${code ? " ("+code+")" : ""}: ${msg}`);
 }
 
-// ===== Webhook helper (PHP callback) =====
-async function consume(payload) {
-  if (!CONSUME_URL) return; // noop if not configured
-  try {
-    await axios.post(CONSUME_URL, payload, {
-      headers: WORKER_SHARED_KEY ? { "X-Worker-Key": WORKER_SHARED_KEY } : {}
-    });
-  } catch (e) {
-    console.error("consume() error:", e?.message || e);
-  }
-}
-
-// ===== GOOGLE (Sheets) =====
 const auth = new google.auth.GoogleAuth({
   keyFile: GOOGLE_KEYFILE,
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
 const sheets = google.sheets({ version: "v4", auth });
 
-// ===== Mailer (Gmail) =====
 const mailer = nodemailer.createTransport({
   service: "gmail",
   auth: { user: GMAIL_USER, pass: GMAIL_PASS }
 });
 
-// ===== JOB TRACKING (for /status) =====
+// ---------- in-memory job tracker (for /status) ----------
 const jobs = new Map();
 function addStep(id, text){
   const cur = jobs.get(id) || { status:"queued", steps:[], error:null, metrics:{} };
@@ -92,7 +90,7 @@ app.get("/status", (req,res)=>{
   res.json(j);
 });
 
-// ===== TIME / FORMAT HELPERS =====
+// ---------- time / format ----------
 function fmtLocalStamp(d){
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: LOCAL_TZ, year:"numeric", month:"short", day:"numeric",
@@ -110,17 +108,11 @@ function fmtLocalStamp(d){
   }
   return `${Y} ${M} ${D} ${hh}:${mm}:${ss} ${ap}`;
 }
-function fmtZhSec(sec){
-  const s = Math.max(0, Math.round(sec||0));
-  const m = Math.floor(s/60);
-  const r = s % 60;
-  return `${m} 分 ${r} 秒`;
-}
 function secsToSheetMinutes(sec){
   return Math.max(1, Math.ceil((sec||0)/60));
 }
 
-// ===== SHEET HEADER (16 columns) =====
+// ---------- sheet header ----------
 const HEADER = [
   "TimestampUTC","TimestampLocal","Email",
   "Seconds","CumulativeSeconds",
@@ -128,28 +120,22 @@ const HEADER = [
   "FileName","FileSizeMB","Language","RequestId",
   "ProcessingMs","Succeeded","ErrorMessage","Model","FileType"
 ];
-
-// Ensure header exists
 async function ensureHeader(){
   try {
     const got = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
-      range: "Sheet1!A1:P1",
+      spreadsheetId: SHEET_ID, range: "Sheet1!A1:P1",
     });
     const cur = got.data.values?.[0] || [];
     const ok = HEADER.length === cur.length && HEADER.every((h,i)=>h===cur[i]);
     if (!ok) {
       await sheets.spreadsheets.values.update({
-        spreadsheetId: SHEET_ID,
-        range: "Sheet1!A1:P1",
-        valueInputOption: "RAW",
-        requestBody: { values: [HEADER] }
+        spreadsheetId: SHEET_ID, range: "Sheet1!A1:P1",
+        valueInputOption: "RAW", requestBody: { values: [HEADER] }
       });
     }
   } catch(e){ console.error("⚠️ ensureHeader:", e.message || e); }
 }
 
-// Header-aware helpers (works with legacy cols)
 function normEmail(x){ return String(x || "").trim().toLowerCase(); }
 function truthy(x){
   const s = String(x ?? "").trim().toLowerCase();
@@ -157,28 +143,24 @@ function truthy(x){
 }
 async function getColumnMap(){
   const hdr = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: "Sheet1!A1:Z1",
+    spreadsheetId: SHEET_ID, range: "Sheet1!A1:Z1",
   });
   const row = hdr.data.values?.[0] || [];
   const map = {};
   row.forEach((name, idx) => { map[String(name || "").trim()] = idx; });
   return {
-    idxEmail:           map["Email"],
-    idxSeconds:         map["Seconds"],
-    idxMinutes:         map["Minutes"],
-    idxSucceeded:       map["Succeeded"],
+    idxEmail:     map["Email"],
+    idxSeconds:   map["Seconds"],
+    idxMinutes:   map["Minutes"],
+    idxSucceeded: map["Succeeded"],
     legacySucceededIdx: (map["Succeeded"] ?? 9),
   };
 }
-
-// Sum prior *successful* rows for this email.
 async function getPastSecondsForEmail(email){
   try {
     const cm = await getColumnMap();
     const resp = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
-      range: "Sheet1!A2:Z",
+      spreadsheetId: SHEET_ID, range: "Sheet1!A2:Z",
       valueRenderOption: "UNFORMATTED_VALUE",
     });
     const rows = resp.data.values || [];
@@ -195,14 +177,9 @@ async function getPastSecondsForEmail(email){
       if (!succeeded) continue;
 
       const sec = Number(r[cm.idxSeconds]);
-      if (!Number.isNaN(sec) && sec > 0){
-        totalSeconds += sec;
-        continue;
-      }
+      if (!Number.isNaN(sec) && sec > 0){ totalSeconds += sec; continue; }
       const min = Number(r[cm.idxMinutes]);
-      if (!Number.isNaN(min) && min > 0){
-        totalSeconds += (min * 60);
-      }
+      if (!Number.isNaN(min) && min > 0){ totalSeconds += (min * 60); }
     }
     return totalSeconds;
   } catch (e) {
@@ -211,7 +188,7 @@ async function getPastSecondsForEmail(email){
   }
 }
 
-// ===== AUDIO PIPELINE =====
+// ---------- audio pipeline ----------
 const OPENAI_AUDIO_MAX = 25 * 1024 * 1024;
 
 function statBytes(p){ try { return fs.statSync(p).size; } catch { return 0; } }
@@ -229,7 +206,6 @@ async function sumSeconds(paths){
   for (const p of paths) t += await getSecondsOne(p);
   return Math.round(t);
 }
-
 async function extractToWav(inPath, outPath){
   await new Promise((resolve, reject)=>{
     ffmpeg(inPath).noVideo()
@@ -281,7 +257,7 @@ async function splitIfNeeded(mp3Path, requestId){
     .map(n=>path.join(dir,n)).sort();
 }
 
-// ===== OpenAI =====
+// ---------- OpenAI ----------
 async function openaiTranscribeVerbose(audioPath, requestId){
   try {
     addStep(requestId, "Calling Whisper /transcriptions …");
@@ -327,7 +303,7 @@ async function zhTwFromOriginalFaithful(originalText, requestId){
   }
 }
 
-// ===== PROCESSOR =====
+// ---------- main processor ----------
 async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }){
   const started = Date.now();
   setJob(requestId, { status:"processing", metrics:{ started } });
@@ -339,27 +315,29 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
   const fileName = fileMeta.originalname || "upload";
   const fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size||0)/(1024*1024))*100)/100);
 
+  // 1) prepare + maybe split
   let prepared, parts=[];
-  let jobSeconds = 0;
-
   try {
-    // Prepare/split
     prepared = await prepareMp3UnderLimit(inputPath, requestId);
     parts = await splitIfNeeded(prepared.path, requestId);
+  } catch (e) {
+    addStep(requestId, "❌ Transcode failed: " + (e?.message || e));
+  }
 
-    // Exact seconds (this job)
+  try {
+    // duration
     const filesForDuration = (parts && parts.length) ? parts : [prepared?.path || inputPath];
-    jobSeconds = await sumSeconds(filesForDuration);
+    const jobSeconds = await sumSeconds(filesForDuration);
     const minutesForSheet = secsToSheetMinutes(jobSeconds);
 
-    // Cumulative seconds from history
+    // cumulative for sheet
     const pastSeconds = await getPastSecondsForEmail(email);
     const cumulativeSeconds = pastSeconds + jobSeconds;
     const cumulativeMinutesForSheet = secsToSheetMinutes(cumulativeSeconds);
 
-    addStep(requestId, `Duration this job: ${fmtZhSec(jobSeconds)}; cumulative: ${fmtZhSec(cumulativeSeconds)}.`);
+    addStep(requestId, `Duration this job: ${jobSeconds}s; cumulative: ${cumulativeSeconds}s.`);
 
-    // Transcribe & translate
+    // transcribe (+ optional translate)
     let originalAll = "";
     const filesForTranscription = (parts && parts.length) ? parts : [prepared?.path || inputPath];
     for (let i=0;i<filesForTranscription.length;i++){
@@ -370,12 +348,9 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     }
     const zhTraditional = await zhTwFromOriginalFaithful(originalAll, requestId);
 
-    // Email body + attachment
-    const costThis = (jobSeconds/60 * 0.05);
+    // email
     const localStamp = fmtLocalStamp(new Date());
-
-    const attachmentText =
-`＝＝ 中文（繁體） ＝＝
+    const attachmentText = `＝＝ 中文（繁體） ＝＝
 ${zhTraditional}
 
 ＝＝ 原文 ＝＝
@@ -384,33 +359,17 @@ ${originalAll}
     const safeBase = (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
     const attachmentName = `${safeBase}-${requestId}.txt`;
 
-    const mailBody =
-`轉寫已完成 ${localStamp}
-
-本次上傳時長：${fmtZhSec(jobSeconds)}
-
-＝＝ 中文 ＝＝
-${zhTraditional}
-
-＝＝ 原文 ＝＝
-${originalAll}
-
-＝＝ 頁尾 ＝＝
-感謝您使用本系統的逐字服務。
-（服務單號：${requestId}）
-`;
-
     addStep(requestId, "Sending email …");
     await mailer.sendMail({
       from: `"逐字稿產生器" <${GMAIL_USER}>`,
       to: email,
       subject: "您的逐字稿（原文與繁體中文）",
-      text: mailBody,
+      text: `轉寫已完成 ${localStamp}\n\n本次上傳時長（秒）：${jobSeconds}\n\n（服務單號：${requestId}）`,
       attachments: [{ filename: attachmentName, content: attachmentText, contentType: "text/plain; charset=utf-8" }]
     });
     addStep(requestId, "Email sent.");
 
-    // Append to Sheet
+    // sheet
     try {
       await ensureHeader();
       const row = [
@@ -442,68 +401,43 @@ ${originalAll}
       addStep(requestId, "⚠️ Sheet append failed: " + (e?.message || e));
     }
 
-    // SUCCESS webhook → PHP
+    // *** TELL PHP the real numbers ***
     await consume({
+      event: "transcription.finished",
+      status: "succeeded",
       email,
       filename: fileName,
-      filesize_bytes: fileMeta.size || 0,
-      duration_sec: jobSeconds,
-      succeeded: true,
       request_id: requestId,
-      job_id: jobId || 0,
-      token: token || ""
+      job_id: jobId || "",
+      token: token || "",
+      duration_sec: jobSeconds,
+      charged_seconds: jobSeconds,  // your billing = real seconds
+      language: language || "",
+      finished_at: new Date().toISOString()
     });
 
   } catch (err) {
     const eMsg = err?.message || "Processing error";
     addStep(requestId, "❌ " + eMsg);
 
-    // failure row in Sheet (best-effort)
-    try {
-      await ensureHeader();
-      const localStamp = fmtLocalStamp(new Date());
-      const pastSeconds = await getPastSecondsForEmail(email);
-      const row = [
-        new Date().toISOString(),
-        localStamp,
-        email,
-        0,
-        pastSeconds,
-        0,
-        secsToSheetMinutes(pastSeconds),
-        fileName,
-        fileSizeMB || 0,
-        "",
-        requestId,
-        Date.now() - started,
-        false,
-        eMsg,
-        "whisper-1",
-        fileType
-      ];
-      await sheets.spreadsheets.values.append({
-        spreadsheetId: SHEET_ID,
-        range: "Sheet1!A:P",
-        valueInputOption: "RAW",
-        requestBody: { values: [row] },
-      });
-    } catch {}
-
-    // FAILURE webhook → PHP
+    // tell PHP that it failed (so it can refund the reservation)
     await consume({
+      event: "transcription.finished",
+      status: "failed",
       email,
       filename: fileName,
-      filesize_bytes: fileMeta.size || 0,
-      duration_sec: 0,
-      succeeded: false,
       request_id: requestId,
-      job_id: jobId || 0,
+      job_id: jobId || "",
       token: token || "",
+      duration_sec: 0,
+      charged_seconds: 0,
+      language: "",
+      finished_at: new Date().toISOString(),
       error: eMsg
     });
   }
 
-  // Cleanup temp files
+  // cleanup
   try { fs.unlinkSync(inputPath); } catch {}
   try {
     if (fs.existsSync(inputPath + ".clean.wav")) fs.unlinkSync(inputPath + ".clean.wav");
@@ -522,36 +456,27 @@ ${originalAll}
   addStep(requestId, "✅ Done");
 }
 
-// ===== ROUTES =====
+// ---------- routes ----------
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     const email = (req.body.email || "").trim();
+    const jobId = (req.body.job_id || "").toString();
+    const token = (req.body.token  || "").toString();
     if (!email) return res.status(400).json({ error: "Email is required" });
     if (!req.file) return res.status(400).json({ error: "File is required" });
-
-    // These are optionally sent by your PHP form; OK if blank
-    const jobId = req.body.job_id ? String(req.body.job_id) : "";
-    const token = req.body.token ? String(req.body.token) : "";
 
     const requestId = crypto.randomUUID();
     setJob(requestId, { status:"accepted", steps:[], error:null, metrics:{} });
     addStep(requestId, "Upload accepted.");
 
-    // respond immediately
     res.status(202).json({ success:true, accepted:true, requestId });
 
-    // background processing
-    setImmediate(()=>processJob({
-      email,
-      inputPath: req.file.path,
-      fileMeta: req.file,
-      requestId,
-      jobId,
-      token
-    }).catch(e=>{
-      addStep(requestId, "❌ Background crash: " + (e?.message || e));
-      setJob(requestId, { status:"error", error: e?.message || String(e) });
-    }));
+    setImmediate(()=>processJob({ email, inputPath: req.file.path, fileMeta: req.file, requestId, jobId, token })
+      .catch(e=>{
+        addStep(requestId, "❌ Background crash: " + (e?.message || e));
+        setJob(requestId, { status:"error", error: e?.message || String(e) });
+      })
+    );
   } catch (err) {
     console.error("❌ accept error:", err?.message || err);
     res.status(500).json({ error: "Processing failed at accept stage" });
