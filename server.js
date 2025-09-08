@@ -10,7 +10,7 @@ import FormData from "form-data";
 import nodemailer from "nodemailer";
 import { google } from "googleapis";
 import crypto from "crypto";
-import ytdl from "ytdl-core";              // ⬅️ NEW
+import ytdl from "ytdl-core";              // YouTube
 // DOCX only
 import { Document, Packer, Paragraph } from "docx";
 
@@ -55,6 +55,9 @@ const ALLOWED_HOSTS = new Set([
   "drive.google.com",
   "dropbox.com","www.dropbox.com","dl.dropboxusercontent.com"
 ]);
+
+// pretend to be a normal desktop browser (helps with YouTube 410 issues)
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
 
 // mail "from" address (defaults to GMAIL_USER)
 const FROM_EMAIL = process.env.FROM_EMAIL || GMAIL_USER;
@@ -365,27 +368,52 @@ async function downloadToTemp({ kind, url, requestId }){
 
   if (kind === "youtube") {
     addStep(requestId, "Fetching from YouTube …");
-    const info = await ytdl.getInfo(url);
-    const title = (info?.videoDetails?.title || "youtube").replace(/[^\w.-]+/g,"_").slice(0,60);
-    await new Promise((resolve, reject)=>{
-      const stream = ytdl(url, { quality: "highestaudio" });
-      const ws = fs.createWriteStream(outPath);
-      stream.on("progress", (_c, chunkLen, _tot)=>{ bytes += chunkLen; if (bytes > FETCH_MAX_BYTES) { stream.destroy(); ws.destroy(); reject(new Error("Remote file too large")); } });
-      stream.on("error", reject);
-      ws.on("error", reject);
-      ws.on("finish", resolve);
-      stream.pipe(ws);
-    });
-    return { path: outPath, bytes, originalname: `${title}.webm`, mimetype: "video/webm" };
+
+    try {
+      // Use real browser UA for both info and stream
+      const info = await ytdl.getInfo(url, {
+        requestOptions: { headers: { "user-agent": UA } }
+      });
+
+      const title = (info?.videoDetails?.title || "youtube")
+        .replace(/[^\w.-]+/g,"_")
+        .slice(0,60);
+
+      await new Promise((resolve, reject)=>{
+        const stream = ytdl(url, {
+          quality: "highestaudio",
+          requestOptions: { headers: { "user-agent": UA } }
+        });
+        const ws = fs.createWriteStream(outPath);
+
+        stream.on("progress", (_c, chunkLen)=> {
+          bytes += chunkLen;
+          if (bytes > FETCH_MAX_BYTES) {
+            stream.destroy(); ws.destroy();
+            reject(new Error("Remote file too large"));
+          }
+        });
+
+        stream.on("error", reject);
+        ws.on("error", reject);
+        ws.on("finish", resolve);
+
+        stream.pipe(ws);
+      });
+
+      return { path: outPath, bytes, originalname: `${title}.webm`, mimetype: "video/webm" };
+    } catch (e) {
+      const sc = e?.statusCode || e?.status || "";
+      throw new Error(sc ? `YouTube download failed (status ${sc}).` : `YouTube download failed: ${e.message}`);
+    }
   }
 
   if (kind === "gdrive" || kind === "dropbox") {
-    const ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
     addStep(requestId, `Fetching from ${kind === "gdrive" ? "Google Drive" : "Dropbox"} …`);
     const resp = await axios.get(url, {
       responseType: "stream",
       maxRedirects: 5,
-      headers: { "User-Agent": ua }
+      headers: { "User-Agent": UA }
     });
     const ct = String(resp.headers["content-type"] || "");
     if (kind === "gdrive" && ct.includes("text/html")) {
@@ -400,7 +428,11 @@ async function downloadToTemp({ kind, url, requestId }){
       const ws = fs.createWriteStream(outPath);
       resp.data.on("data", (chunk)=>{
         bytes += chunk.length;
-        if (bytes > FETCH_MAX_BYTES) { resp.data.destroy(new Error("Remote file too large")); ws.destroy(); reject(new Error("Remote file too large")); }
+        if (bytes > FETCH_MAX_BYTES) {
+          resp.data.destroy(new Error("Remote file too large"));
+          ws.destroy();
+          reject(new Error("Remote file too large"));
+        }
       });
       resp.data.on("error", reject);
       ws.on("error", reject);
@@ -611,7 +643,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// ⬇️ NEW: /fetch — accept a link (YouTube / Google Drive public / Dropbox public)
+// ⬇️ /fetch — accept a link (YouTube / Google Drive public / Dropbox public)
 app.post("/fetch", async (req, res) => {
   try {
     const email = String(req.body.email || "").trim();
