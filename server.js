@@ -10,6 +10,7 @@ import FormData from "form-data";
 import nodemailer from "nodemailer";
 import { google } from "googleapis";
 import crypto from "crypto";
+import ytdl from "ytdl-core";              // ⬅️ NEW
 // DOCX only
 import { Document, Packer, Paragraph } from "docx";
 
@@ -34,16 +35,26 @@ async function consume(payload) {
 const app = express();
 app.use(cors({ origin: "*" }));
 app.options("*", cors());
+app.use(express.json({ limit: "1mb" }));
 const upload = multer({ dest: "/tmp" });
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
 // ---------- env checks ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const GMAIL_USER     = process.env.GMAIL_USER;   // set to help@voixl.com
-const GMAIL_PASS     = process.env.GMAIL_PASS;   // your app password
+const GMAIL_USER     = process.env.GMAIL_USER;   // help@voixl.com
+const GMAIL_PASS     = process.env.GMAIL_PASS;   // app password
 const SHEET_ID       = process.env.SHEET_ID;
 const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATIONS_CREDENTIALS || process.env.GOOGLE_APPLICATION_CREDENTIALS;
 const LOCAL_TZ       = process.env.LOCAL_TZ || "America/Los_Angeles";
+
+// fetch constraints
+const FETCH_MAX_BYTES = Number(process.env.FETCH_MAX_BYTES || 1.5 * 1024 * 1024 * 1024); // ~1.5 GB hard cap
+const ALLOWED_HOSTS = new Set([
+  "youtube.com","www.youtube.com","m.youtube.com","music.youtube.com",
+  "youtu.be",
+  "drive.google.com",
+  "dropbox.com","www.dropbox.com","dl.dropboxusercontent.com"
+]);
 
 // mail "from" address (defaults to GMAIL_USER)
 const FROM_EMAIL = process.env.FROM_EMAIL || GMAIL_USER;
@@ -77,8 +88,8 @@ const mailer = nodemailer.createTransport({
   port: 465,
   secure: true, // SSL
   auth: {
-    user: GMAIL_USER,   // help@voixl.com
-    pass: GMAIL_PASS    // app password
+    user: GMAIL_USER,
+    pass: GMAIL_PASS
   }
 });
 
@@ -313,6 +324,95 @@ async function zhTwFromOriginalFaithful(originalText, requestId){
   }
 }
 
+// ---------- link helpers (YouTube / Drive / Dropbox) ----------
+function parseUrlSafe(u){
+  try { return new URL(String(u)); } catch { return null; }
+}
+function hostAllowed(u){
+  const h = (u.hostname || "").toLowerCase();
+  return ALLOWED_HOSTS.has(h);
+}
+function detectKind(u){
+  const h = (u.hostname || "").toLowerCase();
+  if (h === "youtu.be" || h.endsWith("youtube.com")) return "youtube";
+  if (h === "drive.google.com") return "gdrive";
+  if (h === "dropbox.com" || h === "www.dropbox.com" || h === "dl.dropboxusercontent.com") return "dropbox";
+  return "unknown";
+}
+function normalizeDrive(urlObj){
+  // Accepted: https://drive.google.com/file/d/FILEID/view?usp=sharing
+  // ->       https://drive.google.com/uc?export=download&id=FILEID
+  const m = urlObj.pathname.match(/\/file\/d\/([^/]+)\//);
+  if (m && m[1]) {
+    return `https://drive.google.com/uc?export=download&id=${m[1]}`;
+  }
+  // Also accept already-normalized uc? links
+  if (urlObj.pathname === "/uc") return urlObj.toString();
+  return null;
+}
+function normalizeDropbox(urlObj){
+  // Convert ?dl=0 share link → direct download ?dl=1
+  if (urlObj.hostname === "dl.dropboxusercontent.com") return urlObj.toString();
+  urlObj.searchParams.set("dl", "1");
+  return urlObj.toString();
+}
+
+/** Stream download with byte limit. Returns { path, bytes, originalname, mimetype } */
+async function downloadToTemp({ kind, url, requestId }){
+  const tmpBase = `/tmp/${requestId}`;
+  const outPath = `${tmpBase}.input`;
+  let bytes = 0;
+
+  if (kind === "youtube") {
+    addStep(requestId, "Fetching from YouTube …");
+    const info = await ytdl.getInfo(url);
+    const title = (info?.videoDetails?.title || "youtube").replace(/[^\w.-]+/g,"_").slice(0,60);
+    await new Promise((resolve, reject)=>{
+      const stream = ytdl(url, { quality: "highestaudio" });
+      const ws = fs.createWriteStream(outPath);
+      stream.on("progress", (_c, chunkLen, _tot)=>{ bytes += chunkLen; if (bytes > FETCH_MAX_BYTES) { stream.destroy(); ws.destroy(); reject(new Error("Remote file too large")); } });
+      stream.on("error", reject);
+      ws.on("error", reject);
+      ws.on("finish", resolve);
+      stream.pipe(ws);
+    });
+    return { path: outPath, bytes, originalname: `${title}.webm`, mimetype: "video/webm" };
+  }
+
+  if (kind === "gdrive" || kind === "dropbox") {
+    const ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
+    addStep(requestId, `Fetching from ${kind === "gdrive" ? "Google Drive" : "Dropbox"} …`);
+    const resp = await axios.get(url, {
+      responseType: "stream",
+      maxRedirects: 5,
+      headers: { "User-Agent": ua }
+    });
+    const ct = String(resp.headers["content-type"] || "");
+    if (kind === "gdrive" && ct.includes("text/html")) {
+      throw new Error("Google Drive says this link is not a direct public download. Make sure sharing is 'Anyone with the link'.");
+    }
+    const cd = String(resp.headers["content-disposition"] || "");
+    let original = "remote";
+    const m = cd.match(/filename\*?=(?:UTF-8''|")?([^"';\r\n]+)/i);
+    if (m && m[1]) original = decodeURIComponent(m[1]).replace(/[^\w.-]+/g,"_").slice(0,80);
+
+    await new Promise((resolve,reject)=>{
+      const ws = fs.createWriteStream(outPath);
+      resp.data.on("data", (chunk)=>{
+        bytes += chunk.length;
+        if (bytes > FETCH_MAX_BYTES) { resp.data.destroy(new Error("Remote file too large")); ws.destroy(); reject(new Error("Remote file too large")); }
+      });
+      resp.data.on("error", reject);
+      ws.on("error", reject);
+      ws.on("finish", resolve);
+      resp.data.pipe(ws);
+    });
+    return { path: outPath, bytes, originalname: original, mimetype: String(resp.headers["content-type"] || "application/octet-stream") };
+  }
+
+  throw new Error("Unsupported source");
+}
+
 // ---------- main processor ----------
 async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }){
   const started = Date.now();
@@ -508,6 +608,65 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   } catch (err) {
     console.error("❌ accept error:", err?.message || err);
     res.status(500).json({ error: "Processing failed at accept stage" });
+  }
+});
+
+// ⬇️ NEW: /fetch — accept a link (YouTube / Google Drive public / Dropbox public)
+app.post("/fetch", async (req, res) => {
+  try {
+    const email = String(req.body.email || "").trim();
+    const urlRaw = String(req.body.url || "").trim();
+    const jobId  = (req.body.job_id || "").toString();
+    const token  = (req.body.token  || "").toString();
+    if (!email) return res.status(400).json({ error: "Email is required" });
+    if (!urlRaw) return res.status(400).json({ error: "URL is required" });
+
+    const u = parseUrlSafe(urlRaw);
+    if (!u) return res.status(400).json({ error: "Bad URL" });
+    if (!hostAllowed(u)) return res.status(400).json({ error: "Only YouTube, Google Drive (public), or Dropbox (public) are allowed." });
+
+    let kind = detectKind(u);
+    let normalized = urlRaw;
+    if (kind === "gdrive") {
+      const n = normalizeDrive(u);
+      if (!n) return res.status(400).json({ error: "Unsupported Google Drive link format. Use a standard sharing link." });
+      normalized = n;
+    }
+    if (kind === "dropbox") {
+      normalized = normalizeDropbox(u);
+    }
+
+    const requestId = crypto.randomUUID();
+    setJob(requestId, { status:"accepted", steps:[], error:null, metrics:{} });
+    addStep(requestId, "Remote fetch accepted.");
+    res.status(202).json({ success:true, accepted:true, requestId });
+
+    // background fetch → process
+    setImmediate(async ()=>{
+      try {
+        const fetched = await downloadToTemp({ kind, url: normalized, requestId });
+        const meta = {
+          originalname: fetched.originalname || "remote",
+          mimetype: fetched.mimetype || "application/octet-stream",
+          size: fetched.bytes || statBytes(fetched.path)
+        };
+        await processJob({ email, inputPath: fetched.path, fileMeta: meta, requestId, jobId, token });
+      } catch (e) {
+        const msg = e?.message || "Remote fetch failed";
+        addStep(requestId, "❌ " + msg);
+        setJob(requestId, { status:"error", error: msg });
+        try { await consume({
+          event:"transcription.finished", status:"failed", email,
+          filename: "remote", request_id: requestId, job_id: jobId || "", token: token || "",
+          duration_sec: 0, charged_seconds: 0, language: "", finished_at: new Date().toISOString(),
+          error: msg
+        }); } catch {}
+      }
+    });
+
+  } catch (err) {
+    console.error("❌ fetch error:", err?.message || err);
+    res.status(500).json({ error: "Fetch failed at accept stage" });
   }
 });
 
