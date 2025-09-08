@@ -1,3 +1,4 @@
+// server.js — smooth "fictional" progress version
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -10,7 +11,6 @@ import FormData from "form-data";
 import nodemailer from "nodemailer";
 import { google } from "googleapis";
 import crypto from "crypto";
-// DOCX only
 import { Document, Packer, Paragraph } from "docx";
 
 // ---------- notify PHP (worker-consume.php) ----------
@@ -39,11 +39,17 @@ ffmpeg.setFfmpegPath(ffmpegStatic);
 
 // ---------- env checks ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const GMAIL_USER     = process.env.GMAIL_USER;   // set to help@voixl.com
-const GMAIL_PASS     = process.env.GMAIL_PASS;   // your app password
+const GMAIL_USER     = process.env.GMAIL_USER;   // help@voixl.com
+const GMAIL_PASS     = process.env.GMAIL_PASS;   // app password
 const SHEET_ID       = process.env.SHEET_ID;
 const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATIONS_CREDENTIALS || process.env.GOOGLE_APPLICATION_CREDENTIALS;
 const LOCAL_TZ       = process.env.LOCAL_TZ || "America/Los_Angeles";
+
+// UI progress tuning (optional env)
+const UI_BASE_MS = Number(process.env.UI_BASE_MS || 25000);            // base budget
+const UI_PER_MB_MS = Number(process.env.UI_PER_MB_MS || 1200);         // add budget per MB
+const UI_CAP_BEFORE_DONE = Number(process.env.UI_CAP_BEFORE_DONE || 97); // % cap until real done
+const UI_SLOW_MS_PER_PERCENT = Number(process.env.UI_SLOW_MS_PER_PERCENT || 4000); // how fast to crawl after budget
 
 // mail "from" address (defaults to GMAIL_USER)
 const FROM_EMAIL = process.env.FROM_EMAIL || GMAIL_USER;
@@ -75,31 +81,97 @@ const sheets = google.sheets({ version: "v4", auth });
 const mailer = nodemailer.createTransport({
   host: "smtp.gmail.com",
   port: 465,
-  secure: true, // SSL
-  auth: {
-    user: GMAIL_USER,   // help@voixl.com
-    pass: GMAIL_PASS    // app password
-  }
+  secure: true,
+  auth: { user: GMAIL_USER, pass: GMAIL_PASS }
 });
 
 // ---------- in-memory job tracker (for /status) ----------
 const jobs = new Map();
-function addStep(id, text){
-  const cur = jobs.get(id) || { status:"queued", steps:[], error:null, metrics:{} };
+
+// ensure a job structure exists; also houses UI smoothing plan
+function ensureJob(id) {
+  return jobs.get(id) || {
+    status: "queued",
+    steps: [],
+    error: null,
+    metrics: {},
+    // UI smoothing state:
+    ui: {
+      startMs: Date.now(),
+      budgetMs: 60000,
+      lastPct: 0,
+      capBeforeDone: UI_CAP_BEFORE_DONE,
+      // for over-budget crawl:
+      slowMsPerPercent: UI_SLOW_MS_PER_PERCENT,
+      // optional static copy; can be updated freely:
+      description: "Queued…"
+    }
+  };
+}
+function addStep(id, text) {
+  const cur = ensureJob(id);
   cur.steps.push({ at: new Date().toISOString(), text });
+  cur.ui.description = text; // keep UI line fresh
   jobs.set(id, cur);
   console.log(`[${id}] ${text}`);
 }
-function setJob(id, patch){
-  const cur = jobs.get(id) || { status:"queued", steps:[], error:null, metrics:{} };
+function setJob(id, patch) {
+  const cur = ensureJob(id);
   jobs.set(id, { ...cur, ...patch });
 }
-app.get("/status", (req,res)=>{
-  const id = (req.query.id||"").toString();
-  if (!id) return res.status(400).json({ error:"Missing id" });
+
+// Compute a smooth, time-based UI % that never goes backwards.
+// - Ramps 0 → cap (e.g., 97%) across budgetMs
+// - If the job takes longer, keep creeping toward cap (slow crawl)
+// - When job.status === "done", return 100 (and record lastPct=100)
+function computeUiProgress(job) {
+  const now = Date.now();
+  const ui = job.ui || { startMs: now, budgetMs: 60000, lastPct: 0, capBeforeDone: UI_CAP_BEFORE_DONE, slowMsPerPercent: UI_SLOW_MS_PER_PERCENT, description: "" };
+  const { startMs, budgetMs, capBeforeDone, slowMsPerPercent } = ui;
+
+  let pct;
+  if (job.status === "done") {
+    pct = 100;
+  } else {
+    const elapsed = Math.max(0, now - startMs);
+    if (elapsed <= budgetMs) {
+      pct = (elapsed / budgetMs) * capBeforeDone;
+    } else {
+      // Over budget: creep forward but don’t look stuck.
+      const over = elapsed - budgetMs;
+      const extra = over / slowMsPerPercent; // percent points gained since budget exhausted
+      pct = Math.min(capBeforeDone, capBeforeDone * 0.9 + extra); // asymptote-ish
+    }
+  }
+  // monotonic & clamped
+  pct = Math.max(ui.lastPct || 0, Math.min(100, Math.round(pct)));
+  ui.lastPct = pct;
+  job.ui = ui;
+  return pct;
+}
+
+// Friendly copy for the bar; you can customize ranges freely
+function progressDescription(pct, fallback) {
+  if (pct < 5)  return "Queued…";
+  if (pct < 15) return "Preparing upload…";
+  if (pct < 30) return "Extracting audio…";
+  if (pct < 45) return "Cleaning & encoding…";
+  if (pct < 60) return "Splitting if needed…";
+  if (pct < 75) return "Transcribing…";
+  if (pct < 90) return "Translating…";
+  if (pct < 97) return "Packaging & emailing…";
+  if (pct < 100) return "Finalizing…";
+  return fallback || "Done";
+}
+
+app.get("/status", (req, res) => {
+  const id = (req.query.id || "").toString();
+  if (!id) return res.status(400).json({ error: "Missing id" });
   const j = jobs.get(id);
-  if (!j) return res.status(404).json({ error:"Not found" });
-  res.json(j);
+  if (!j) return res.status(404).json({ error: "Not found" });
+  const progress = computeUiProgress(j);
+  const description = progressDescription(progress, j.ui?.description || j.steps?.slice(-1)?.[0]?.text || "");
+  res.json({ ...j, progress, description });
 });
 
 // ---------- time / format ----------
@@ -217,7 +289,8 @@ async function sumSeconds(paths){
   for (const p of paths) t += await getSecondsOne(p);
   return Math.round(t);
 }
-async function extractToWav(inPath, outPath){
+async function extractToWav(inPath, _outPath){ // (we'll set path inside)
+  const outPath = inPath + ".clean.wav";
   await new Promise((resolve, reject)=>{
     ffmpeg(inPath).noVideo()
       .audioCodec("pcm_s16le").audioChannels(1).audioFrequency(16000)
@@ -229,19 +302,18 @@ async function wavToMp3Filtered(inWav, outMp3, kbps){
   await new Promise((resolve, reject)=>{
     ffmpeg(inWav)
       .audioFilters(["highpass=f=200","lowpass=f=3800","dynaudnorm"])
-      .outputOptions(["-vn","-ac","1","-ar","16000","-b:a",`${kbps}k`,"-codec:a","libmp3lame"])
+      .outputOptions(["-vn","-ac","1","-ar","16000","-b:a",`${kbps}k","-codec:a","libmp3lame"])
       .save(outMp3).on("end", resolve).on("error", reject);
   });
   return outMp3;
 }
 async function prepareMp3UnderLimit(inMediaPath, requestId){
-  const tmpWav = inMediaPath + ".clean.wav";
+  const tmpWav = await extractToWav(inMediaPath);
   addStep(requestId, "Extracting audio → WAV …");
-  await extractToWav(inMediaPath, tmpWav);
   const ladder = [64,48,32,24];
   for (const kb of ladder){
-    const out = inMediaPath + `.${kb}k.mp3`;
     addStep(requestId, `Encode MP3 ${kb} kbps …`);
+    const out = inMediaPath + `.${kb}k.mp3`;
     await wavToMp3Filtered(tmpWav, out, kb);
     const sz = statBytes(out);
     addStep(requestId, `MP3 ${kb} kbps = ${(sz/1024/1024).toFixed(2)} MB`);
@@ -289,14 +361,13 @@ async function openaiTranscribeVerbose(audioPath, requestId){
 }
 async function zhTwFromOriginalFaithful(originalText, requestId){
   try {
-    addStep(requestId, "Calling GPT 原文→繁中 (faithful) …");
+    addStep(requestId, "Translating to Traditional Chinese …");
     const systemPrompt =
 `你是國際會議的專業口筆譯員。請把使用者提供的「原文」完整翻譯成「繁體中文（台灣慣用）」並嚴格遵守：
 1) 忠實轉譯：不可增刪、不可臆測，不加入任何評論；僅做必要語法與詞序調整以使中文通順。
 2) 句序與段落：依原文順序與段落輸出；保留所有重複、口號與語氣詞。
-3) 中英夾雜：凡是非中文的片段（英語、法語、西班牙語、德語、日語、韓語等任何語種的詞句、人名地名、術語）一律翻成中文。不得保留原語言（含英文）單字。
-4) 標點使用中文全形標點。只輸出中文譯文，不要任何說明。
-5) 適用範圍：以上規則（1–4）不論原文語言為何（只要 Whisper 能辨識的語言）皆一體適用；專有名詞採常見中譯或音譯，若無通行譯名則以自然音譯呈現，亦不得夾帶原文括註。`;
+3) 中英夾雜：凡是非中文的片段（任何語種的詞句、人名地名、術語）盡量翻成中文。
+4) 標點使用中文全形標點。只輸出中文譯文。`;
     const r = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       { model:"gpt-4o-mini", temperature:0, messages:[
@@ -305,7 +376,7 @@ async function zhTwFromOriginalFaithful(originalText, requestId){
       ]},
       { headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` } }
     );
-    addStep(requestId, "繁中 done.");
+    addStep(requestId, "Translation done.");
     return r.data?.choices?.[0]?.message?.content?.trim() || "";
   } catch (err) {
     logAxiosError(`[${requestId}] GPT 原文→繁中`, err);
@@ -316,38 +387,47 @@ async function zhTwFromOriginalFaithful(originalText, requestId){
 // ---------- main processor ----------
 async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }){
   const started = Date.now();
-  setJob(requestId, { status:"processing", metrics:{ started } });
-  addStep(requestId, `Accepted: ${fileMeta.originalname} (${(fileMeta.size/1024/1024).toFixed(2)} MB)`);
+  const fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size||0)/(1024*1024))*100)/100);
+
+  // Set up UI plan for smooth progress:
+  const budgetMs = Math.max(30000, UI_BASE_MS + UI_PER_MB_MS * Math.min(fileSizeMB, 500)); // clamp 0–500MB
+  setJob(requestId, {
+    status:"processing",
+    metrics:{ started },
+    ui: {
+      startMs: Date.now(),
+      budgetMs,
+      lastPct: 0,
+      capBeforeDone: UI_CAP_BEFORE_DONE,
+      slowMsPerPercent: UI_SLOW_MS_PER_PERCENT,
+      description: "Preparing…"
+    }
+  });
+  addStep(requestId, `Accepted: ${fileMeta.originalname} (${fileSizeMB.toFixed(2)} MB)`);
 
   const model = "whisper-1";
   let language = "";
   const fileType = fileMeta.mimetype || "";
   const fileName = fileMeta.originalname || "upload";
-  const fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size||0)/(1024*1024))*100)/100);
 
-  // 1) prepare + maybe split
   let prepared, parts=[];
+
   try {
+    // 1) prepare + maybe split
     prepared = await prepareMp3UnderLimit(inputPath, requestId);
     parts = await splitIfNeeded(prepared.path, requestId);
-  } catch (e) {
-    addStep(requestId, "❌ Transcode failed: " + (e?.message || e));
-  }
 
-  try {
-    // duration
+    // 2) duration & cumulative
     const filesForDuration = (parts && parts.length) ? parts : [prepared?.path || inputPath];
+    addStep(requestId, "Measuring duration …");
     const jobSeconds = await sumSeconds(filesForDuration);
     const minutesForSheet = secsToSheetMinutes(jobSeconds);
-
-    // cumulative for sheet
     const pastSeconds = await getPastSecondsForEmail(email);
     const cumulativeSeconds = pastSeconds + jobSeconds;
     const cumulativeMinutesForSheet = secsToSheetMinutes(cumulativeSeconds);
-
     addStep(requestId, `Duration this job: ${jobSeconds}s; cumulative: ${cumulativeSeconds}s.`);
 
-    // transcribe + translate
+    // 3) transcribe + translate
     let originalAll = "";
     const filesForTranscription = (parts && parts.length) ? parts : [prepared?.path || inputPath];
     for (let i=0;i<filesForTranscription.length;i++){
@@ -370,7 +450,6 @@ ${originalAll}
     const txtName  = `${safeBase}-${requestId}.txt`;
     const docxName = `${safeBase}-${requestId}.docx`;
 
-    // DOCX
     const doc = new Document({
       sections: [{
         children: [
@@ -398,7 +477,7 @@ ${originalAll}
     });
     addStep(requestId, "Email sent.");
 
-    // sheet append
+    // 4) sheet append
     try {
       await ensureHeader();
       const row = [
@@ -430,7 +509,6 @@ ${originalAll}
       addStep(requestId, "⚠️ Sheet append failed: " + (e?.message || e));
     }
 
-    // tell PHP actual usage
     await consume({
       event: "transcription.finished",
       status: "succeeded",
@@ -448,7 +526,6 @@ ${originalAll}
   } catch (err) {
     const eMsg = err?.message || "Processing error";
     addStep(requestId, "❌ " + eMsg);
-
     await consume({
       event: "transcription.finished",
       status: "failed",
@@ -468,7 +545,6 @@ ${originalAll}
   // cleanup
   try { fs.unlinkSync(inputPath); } catch {}
   try {
-    if (fs.existsSync(inputPath + ".clean.wav")) fs.unlinkSync(inputPath + ".clean.wav");
     const dir = path.dirname(inputPath);
     fs.readdirSync(dir).forEach(n=>{
       if (n.startsWith(path.basename(inputPath)) && (n.endsWith(".mp3") || n.endsWith(".wav")))
@@ -494,15 +570,32 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "File is required" });
 
     const requestId = crypto.randomUUID();
-    setJob(requestId, { status:"accepted", steps:[], error:null, metrics:{} });
-    addStep(requestId, "Upload accepted.");
 
+    // initialize job with a smoothing plan seeded by file size
+    const fileSizeMB = Math.max(0.01, Math.round(((req.file.size||0)/(1024*1024))*100)/100);
+    const budgetMs = Math.max(30000, UI_BASE_MS + UI_PER_MB_MS * Math.min(fileSizeMB, 500));
+    jobs.set(requestId, {
+      status:"accepted",
+      steps:[],
+      error:null,
+      metrics:{},
+      ui: {
+        startMs: Date.now(),
+        budgetMs,
+        lastPct: 0,
+        capBeforeDone: UI_CAP_BEFORE_DONE,
+        slowMsPerPercent: UI_SLOW_MS_PER_PERCENT,
+        description: "Upload accepted…"
+      }
+    });
+
+    addStep(requestId, "Upload accepted.");
     res.status(202).json({ success:true, accepted:true, requestId });
 
     setImmediate(()=>processJob({ email, inputPath: req.file.path, fileMeta: req.file, requestId, jobId, token })
       .catch(e=>{
         addStep(requestId, "❌ Background crash: " + (e?.message || e));
-        setJob(requestId, { status:"error", error: e?.message || String(e) });
+        setJob(requestId, { status:"done", error: e?.message || String(e) });
       })
     );
   } catch (err) {
