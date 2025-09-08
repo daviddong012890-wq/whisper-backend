@@ -39,11 +39,15 @@ ffmpeg.setFfmpegPath(ffmpegStatic);
 
 // ---------- env checks ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const GMAIL_USER     = process.env.GMAIL_USER;
-const GMAIL_PASS     = process.env.GMAIL_PASS;
+const GMAIL_USER     = process.env.GMAIL_USER;   // set to help@voixl.com
+const GMAIL_PASS     = process.env.GMAIL_PASS;   // your app password
 const SHEET_ID       = process.env.SHEET_ID;
 const GOOGLE_KEYFILE = process.env.GOOGLE_APPLICATIONS_CREDENTIALS || process.env.GOOGLE_APPLICATION_CREDENTIALS;
 const LOCAL_TZ       = process.env.LOCAL_TZ || "America/Los_Angeles";
+
+// mail "from" address (defaults to GMAIL_USER)
+const FROM_EMAIL = process.env.FROM_EMAIL || GMAIL_USER;
+const FROM_NAME  = process.env.FROM_NAME  || "逐字稿產生器";
 
 function fatal(m){ console.error("❌ " + m); process.exit(1); }
 if (!OPENAI_API_KEY) fatal("Missing OPENAI_API_KEY");
@@ -58,7 +62,7 @@ function logAxiosError(prefix, err) {
   const status = err?.response?.status;
   const code   = err?.code;
   const msg = err?.response?.data?.error?.message || err?.message || String(err);
-  console.error(`${prefix}${status ? " [${status}]" : ""}${code ? " (${code})" : ""}: ${msg}`);
+  console.error(`${prefix}${status ? " ["+status+"]" : ""}${code ? " ("+code+")" : ""}: ${msg}`);
 }
 
 const auth = new google.auth.GoogleAuth({
@@ -67,9 +71,15 @@ const auth = new google.auth.GoogleAuth({
 });
 const sheets = google.sheets({ version: "v4", auth });
 
+// ---------- MAILER (explicit Gmail SMTP) ----------
 const mailer = nodemailer.createTransport({
-  service: "gmail",
-  auth: { user: GMAIL_USER, pass: GMAIL_PASS }
+  host: "smtp.gmail.com",
+  port: 465,
+  secure: true, // SSL
+  auth: {
+    user: GMAIL_USER,   // help@voixl.com
+    pass: GMAIL_PASS    // app password
+  }
 });
 
 // ---------- in-memory job tracker (for /status) ----------
@@ -376,8 +386,9 @@ ${originalAll}
 
     addStep(requestId, "Sending email …");
     await mailer.sendMail({
-      from: `"逐字稿產生器" <${GMAIL_USER}>`,
+      from: `${FROM_NAME} <${FROM_EMAIL}>`,
       to: email,
+      replyTo: FROM_EMAIL,
       subject: "您的逐字稿（原文與繁體中文）",
       text: `轉寫已完成 ${localStamp}\n\n本次上傳時長（秒）：${jobSeconds}\n\n（服務單號：${requestId}）`,
       attachments: [
