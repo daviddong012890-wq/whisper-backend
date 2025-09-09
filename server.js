@@ -704,6 +704,7 @@ ${originalAll}
       text: `轉寫已完成 ${localStamp}
 
 本次上傳時長（秒）：${jobSeconds}
+檔案名稱：${fileMeta.originalname}
 
 （服務單號：${requestId}）`,
       attachments: [
