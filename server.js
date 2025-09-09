@@ -17,7 +17,10 @@ import { Document, Packer, Paragraph } from "docx";
 // ---------- notify PHP (worker-consume.php) ----------
 const CONSUME_URL = process.env.CONSUME_URL || "";
 const WORKER_SHARED_KEY = process.env.WORKER_SHARED_KEY || "";
-const CALLBACK_URL = process.env.CALLBACK_URL || ""; // <-- ADDED
+
+// ---------- PHP endpoints ----------
+const CALLBACK_URL = process.env.CALLBACK_URL || ""; // e.g. https://voixl.com/worker-callback.php
+const STORE_URL    = process.env.STORE_URL || "";    // e.g. https://voixl.com/store-transcript.php
 
 async function consume(payload) {
   if (!CONSUME_URL) return;
@@ -32,14 +35,15 @@ async function consume(payload) {
   }
 }
 
-// ---------- NEW: notify PHP dashboard (worker-callback.php) ----------
-async function updateStatus(jobId, status, durationSec = 0) {
+// ---------- notify PHP dashboard (worker-callback.php) ----------
+// CHANGED: send request_id (not job_id)
+async function updateStatus(requestId, status, durationSec = 0) {
   if (!CALLBACK_URL) return;
   try {
     await axios.post(
       CALLBACK_URL,
       new URLSearchParams({
-        job_id: jobId,
+        request_id: requestId,
         status: status,
         duration_sec: durationSec.toString(),
       }),
@@ -51,9 +55,43 @@ async function updateStatus(jobId, status, durationSec = 0) {
         timeout: 10000,
       }
     );
-    console.log(`→ updateStatus(${jobId}, ${status}) ok`);
+    console.log(`→ updateStatus(${requestId}, ${status}) ok`);
   } catch (err) {
     console.error("updateStatus error:", err?.response?.status, err?.message || err);
+  }
+}
+
+// ---------- NEW: store TXT/DOCX on PHP (store-transcript.php) ----------
+async function storeTranscript(requestId, txtContent, docxBuffer) {
+  if (!STORE_URL) return;
+  try {
+    const fd = new FormData();
+    fd.append("request_id", requestId);
+    if (txtContent) {
+      fd.append("txt", Buffer.from(txtContent, "utf8"), {
+        filename: "transcript.txt",
+        contentType: "text/plain; charset=utf-8",
+      });
+    }
+    if (docxBuffer) {
+      fd.append("docx", docxBuffer, {
+        filename: "transcript.docx",
+        contentType:
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      });
+    }
+    await axios.post(STORE_URL, fd, {
+      headers: {
+        "X-Worker-Key": WORKER_SHARED_KEY,
+        ...fd.getHeaders(),
+      },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      timeout: 20000,
+    });
+    console.log(`→ storeTranscript(${requestId}) ok`);
+  } catch (err) {
+    console.error("storeTranscript error:", err?.response?.status, err?.message || err);
   }
 }
 
@@ -107,10 +145,6 @@ if (!OPENAI_API_KEY) fatal("Missing OPENAI_API_KEY");
 if (!GMAIL_USER || !GMAIL_PASS) fatal("Missing GMAIL_USER or GMAIL_PASS");
 
 // ---------- Postgres pool ----------
-/**
- * Prefer Render’s DATABASE_URL. Fallback to DB_* if provided.
- * DATABASE_URL example: postgres://user:pass@host:5432/dbname
- */
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const DB_HOST = process.env.DB_HOST || "";
 const DB_PORT = Number(process.env.DB_PORT || 5432);
@@ -149,7 +183,6 @@ pool
  *  - transcriptions (columns your code writes to)
  * ------------------------------------------------------ */
 async function ensureSchema() {
-  // jobs table: unquoted names -> lowercase (requestid)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS jobs (
       requestid   TEXT PRIMARY KEY,
@@ -161,7 +194,6 @@ async function ensureSchema() {
     CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
   `);
 
-  // transcriptions table with the columns your inserts expect
   await pool.query(`
     CREATE TABLE IF NOT EXISTS transcriptions (
       id                 BIGSERIAL PRIMARY KEY,
@@ -190,7 +222,6 @@ async function ensureSchema() {
   console.log("✅ Schema ready (jobs, transcriptions)");
 }
 
-// init schema at boot (fail fast if cannot create)
 await ensureSchema().catch((e) => {
   console.error("❌ Schema init failed:", e);
   process.exit(1);
@@ -403,7 +434,7 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
       .on("error", reject);
   });
   const dir = path.dirname(outPattern);
-  const base = path.basename(outPattern).split("%")[0]; // prefix before %03d
+  const base = path.basename(outPattern).split("%")[0];
   const files = fs
     .readdirSync(dir)
     .filter((n) => n.startsWith(base) && n.endsWith(".mp3"))
@@ -444,9 +475,7 @@ async function openaiTranscribeVerbose(audioPath, requestId) {
 }
 
 // ---------- retries & bounded concurrency ----------
-function sleepMs(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
 async function withRetries(fn, { maxAttempts = 5, baseDelayMs = 700 } = {}) {
   let attempt = 0;
   while (true) {
@@ -465,8 +494,7 @@ async function withRetries(fn, { maxAttempts = 5, baseDelayMs = 700 } = {}) {
 }
 async function runBounded(tasks, limit = 3) {
   const results = new Array(tasks.length);
-  let next = 0,
-    active = 0;
+  let next = 0, active = 0;
   return new Promise((resolve, reject) => {
     const launch = () => {
       if (next >= tasks.length && active === 0) return resolve(results);
@@ -475,14 +503,9 @@ async function runBounded(tasks, limit = 3) {
         active++;
         Promise.resolve()
           .then(() => tasks[idx]())
-          .then((r) => {
-            results[idx] = r;
-          })
+          .then((r) => { results[idx] = r; })
           .catch(reject)
-          .finally(() => {
-            active--;
-            launch();
-          });
+          .finally(() => { active--; launch(); });
       }
     };
     launch();
@@ -490,6 +513,7 @@ async function runBounded(tasks, limit = 3) {
 }
 
 // ---------- GPT translation (multilingual → zh-TW, robust) ----------
+// UNCHANGED SystemPrompt (your original):
 async function gptTranslateFaithful(originalAll, requestId) {
   const systemPrompt = `你是國際會議的一線口筆譯員。請把使用者提供的「原文」完整翻譯成「繁體中文（台灣慣用）」並嚴格遵守：
 
@@ -540,7 +564,7 @@ async function gptTranslateFaithful(originalAll, requestId) {
 // ---------- main processor ----------
 async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }) {
   await setJobStatus(requestId, "processing");
-  await updateStatus(requestId, "processing"); // <-- ADDED
+  await updateStatus(requestId, "processing"); // CHANGED: requestId
 
   addStep(
     requestId,
@@ -575,9 +599,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       addStep(requestId, `Encoded size: ${(sz / 1024 / 1024).toFixed(2)} MB`);
       if (sz > OPENAI_AUDIO_MAX) {
         addStep(requestId, "Single file still >25MB — encoding again with segmentation …");
-        try {
-          fs.unlinkSync(singleOut);
-        } catch {}
+        try { fs.unlinkSync(singleOut); } catch {}
         tempFiles.delete(singleOut);
         const segSec = computeSegmentSeconds(kbps);
         const pattern = `${tmpBase}.part-%03d.mp3`;
@@ -634,10 +656,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       addStep(requestId, `Part ${idx + 1}/${parts.length} → start`);
       const res = await withRetries(
         () => openaiTranscribeVerbose(filePath, requestId),
-        {
-          maxAttempts: 5,
-          baseDelayMs: 700,
-        }
+        { maxAttempts: 5, baseDelayMs: 700 }
       );
       addStep(requestId, `Part ${idx + 1}/${parts.length} → done`);
       return res;
@@ -650,12 +669,10 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       originalAll += (originalAll ? "\n\n" : "") + (verbose?.text || "");
     }
 
-    // zh-TW faithful translation (multilingual) — robust against socket hangups
+    // zh-TW faithful translation (UNCHANGED prompt)
     addStep(requestId, "Calling GPT 原文→繁中 (faithful, multilingual) …");
     let zhTraditional = "";
     try {
-      // If you fear extremely long prompts, you can cap length:
-      // const inputForGpt = (originalAll || "").slice(0, 20000);
       const inputForGpt = originalAll || "";
       zhTraditional = await gptTranslateFaithful(inputForGpt, requestId);
       addStep(requestId, "繁中 done.");
@@ -723,6 +740,9 @@ ${originalAll}
     });
     addStep(requestId, "Email sent.");
 
+    // ✅ also save TXT/DOCX to your PHP storage so dashboard buttons work
+    await storeTranscript(requestId, attachmentText, docxBuffer);
+
     // insert transcriptions row
     try {
       const sql = `
@@ -775,7 +795,7 @@ ${originalAll}
       language: language || "",
       finished_at: new Date().toISOString(),
     });
-    await updateStatus(requestId, "succeeded", jobSeconds); // <-- ADDED
+    await updateStatus(requestId, "succeeded", jobSeconds); // CHANGED: requestId
     await setJobStatus(requestId, "done");
     addStep(requestId, "✅ Done");
   } catch (err) {
@@ -796,7 +816,7 @@ ${originalAll}
       finished_at: new Date().toISOString(),
       error: eMsg,
     });
-    await updateStatus(requestId, "processing_fail"); // <-- ADDED
+    await updateStatus(requestId, "processing_fail"); // CHANGED: requestId
   } finally {
     addStep(requestId, "Cleaning up temporary files...");
     for (const f of Array.from(tempFiles)) {
@@ -859,7 +879,7 @@ app.post(
         console.error(`[${requestId}] Background crash:`, e?.message || e);
         try {
           await setJobStatus(requestId, "error", e?.message || String(e));
-          await updateStatus(requestId, "processing_fail"); // <-- ADDED
+          await updateStatus(requestId, "processing_fail"); // CHANGED: requestId
         } catch {}
       }
     });
