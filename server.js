@@ -10,7 +10,8 @@ import FormData from "form-data";
 import nodemailer from "nodemailer";
 import { google } from "googleapis";
 import crypto from "crypto";
-import ytdl from "ytdl-core";              // YouTube
+import ytdl from "ytdl-core";              // keep ytdl-core
+import ytdlp from "yt-dlp-exec";            // NEW: yt-dlp fallback
 // DOCX only
 import { Document, Packer, Paragraph } from "docx";
 
@@ -56,9 +57,6 @@ const ALLOWED_HOSTS = new Set([
   "dropbox.com","www.dropbox.com","dl.dropboxusercontent.com"
 ]);
 
-// pretend to be a normal desktop browser (helps with YouTube 410 issues)
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
-
 // mail "from" address (defaults to GMAIL_USER)
 const FROM_EMAIL = process.env.FROM_EMAIL || GMAIL_USER;
 const FROM_NAME  = process.env.FROM_NAME  || "逐字稿產生器";
@@ -78,6 +76,7 @@ function logAxiosError(prefix, err) {
   const msg = err?.response?.data?.error?.message || err?.message || String(err);
   console.error(`${prefix}${status ? " ["+status+"]" : ""}${code ? " ("+code+")" : ""}: ${msg}`);
 }
+function statBytes(p){ try { return fs.statSync(p).size; } catch { return 0; } }
 
 const auth = new google.auth.GoogleAuth({
   keyFile: GOOGLE_KEYFILE,
@@ -89,11 +88,8 @@ const sheets = google.sheets({ version: "v4", auth });
 const mailer = nodemailer.createTransport({
   host: "smtp.gmail.com",
   port: 465,
-  secure: true, // SSL
-  auth: {
-    user: GMAIL_USER,
-    pass: GMAIL_PASS
-  }
+  secure: true,
+  auth: { user: GMAIL_USER, pass: GMAIL_PASS }
 });
 
 // ---------- in-memory job tracker (for /status) ----------
@@ -215,8 +211,6 @@ async function getPastSecondsForEmail(email){
 
 // ---------- audio pipeline ----------
 const OPENAI_AUDIO_MAX = 25 * 1024 * 1024;
-
-function statBytes(p){ try { return fs.statSync(p).size; } catch { return 0; } }
 
 function getSecondsOne(filePath){
   return new Promise((resolve, reject)=>{
@@ -343,21 +337,64 @@ function detectKind(u){
   return "unknown";
 }
 function normalizeDrive(urlObj){
-  // Accepted: https://drive.google.com/file/d/FILEID/view?usp=sharing
-  // ->       https://drive.google.com/uc?export=download&id=FILEID
   const m = urlObj.pathname.match(/\/file\/d\/([^/]+)\//);
-  if (m && m[1]) {
-    return `https://drive.google.com/uc?export=download&id=${m[1]}`;
-  }
-  // Also accept already-normalized uc? links
+  if (m && m[1]) return `https://drive.google.com/uc?export=download&id=${m[1]}`;
   if (urlObj.pathname === "/uc") return urlObj.toString();
   return null;
 }
 function normalizeDropbox(urlObj){
-  // Convert ?dl=0 share link → direct download ?dl=1
   if (urlObj.hostname === "dl.dropboxusercontent.com") return urlObj.toString();
   urlObj.searchParams.set("dl", "1");
   return urlObj.toString();
+}
+
+const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36";
+
+/** Download YouTube audio.
+ * Strategy: try ytdl-core first; on error (incl. 410/403), fall back to yt-dlp (using our ffmpeg-static).
+ */
+async function downloadYouTube(url, outPathBase, requestId){
+  // 1) Try ytdl-core
+  try {
+    addStep(requestId, "Fetching from YouTube via ytdl-core …");
+    const info = await ytdl.getInfo(url);
+    const title = (info?.videoDetails?.title || "youtube").replace(/[^\w.-]+/g,"_").slice(0,60);
+    const outPath = `${outPathBase}.webm`;
+    await new Promise((resolve, reject)=>{
+      const stream = ytdl(url, {
+        quality: "highestaudio",
+        requestOptions: { headers: { "User-Agent": UA } },
+        highWaterMark: 1<<25   // 32MB buffer to reduce throttling
+      });
+      let bytes = 0;
+      const ws = fs.createWriteStream(outPath);
+      stream.on("progress", (_c, chunkLen)=>{ bytes += chunkLen; if (bytes > FETCH_MAX_BYTES) { stream.destroy(); ws.destroy(); reject(new Error("Remote file too large")); } });
+      stream.on("error", reject);
+      ws.on("error", reject);
+      ws.on("finish", resolve);
+      stream.pipe(ws);
+    });
+    return { path: `${outPathBase}.webm`, bytes: statBytes(`${outPathBase}.webm`), originalname: `${title}.webm`, mimetype: "video/webm" };
+  } catch (e) {
+    addStep(requestId, `ytdl-core failed (${e?.statusCode || e?.code || ""}). Falling back to yt-dlp …`);
+  }
+
+  // 2) Fallback: yt-dlp (much more robust)
+  const outPath = `${outPathBase}.m4a`;
+  await ytdlp(url, {
+    output: outPath,
+    format: "bestaudio[ext=m4a]/bestaudio/best",
+    ffmpegLocation: ffmpegStatic,   // use our static ffmpeg
+    addHeader: [`User-Agent:${UA}`],
+    noWarnings: true,
+    noCheckCertificates: true,
+    restrictFilenames: true,
+    socketTimeout: 30
+  });
+  const size = statBytes(outPath);
+  if (size <= 0) throw new Error("yt-dlp produced no file");
+  if (size > FETCH_MAX_BYTES) { try { fs.unlinkSync(outPath); } catch {} throw new Error("Remote file too large"); }
+  return { path: outPath, bytes: size, originalname: "youtube.m4a", mimetype: "audio/mp4" };
 }
 
 /** Stream download with byte limit. Returns { path, bytes, originalname, mimetype } */
@@ -367,53 +404,16 @@ async function downloadToTemp({ kind, url, requestId }){
   let bytes = 0;
 
   if (kind === "youtube") {
-    addStep(requestId, "Fetching from YouTube …");
-
-    try {
-      // Use real browser UA for both info and stream
-      const info = await ytdl.getInfo(url, {
-        requestOptions: { headers: { "user-agent": UA } }
-      });
-
-      const title = (info?.videoDetails?.title || "youtube")
-        .replace(/[^\w.-]+/g,"_")
-        .slice(0,60);
-
-      await new Promise((resolve, reject)=>{
-        const stream = ytdl(url, {
-          quality: "highestaudio",
-          requestOptions: { headers: { "user-agent": UA } }
-        });
-        const ws = fs.createWriteStream(outPath);
-
-        stream.on("progress", (_c, chunkLen)=> {
-          bytes += chunkLen;
-          if (bytes > FETCH_MAX_BYTES) {
-            stream.destroy(); ws.destroy();
-            reject(new Error("Remote file too large"));
-          }
-        });
-
-        stream.on("error", reject);
-        ws.on("error", reject);
-        ws.on("finish", resolve);
-
-        stream.pipe(ws);
-      });
-
-      return { path: outPath, bytes, originalname: `${title}.webm`, mimetype: "video/webm" };
-    } catch (e) {
-      const sc = e?.statusCode || e?.status || "";
-      throw new Error(sc ? `YouTube download failed (status ${sc}).` : `YouTube download failed: ${e.message}`);
-    }
+    return await downloadYouTube(url, tmpBase, requestId);
   }
 
   if (kind === "gdrive" || kind === "dropbox") {
+    const ua = UA;
     addStep(requestId, `Fetching from ${kind === "gdrive" ? "Google Drive" : "Dropbox"} …`);
     const resp = await axios.get(url, {
       responseType: "stream",
       maxRedirects: 5,
-      headers: { "User-Agent": UA }
+      headers: { "User-Agent": ua }
     });
     const ct = String(resp.headers["content-type"] || "");
     if (kind === "gdrive" && ct.includes("text/html")) {
@@ -428,11 +428,7 @@ async function downloadToTemp({ kind, url, requestId }){
       const ws = fs.createWriteStream(outPath);
       resp.data.on("data", (chunk)=>{
         bytes += chunk.length;
-        if (bytes > FETCH_MAX_BYTES) {
-          resp.data.destroy(new Error("Remote file too large"));
-          ws.destroy();
-          reject(new Error("Remote file too large"));
-        }
+        if (bytes > FETCH_MAX_BYTES) { resp.data.destroy(new Error("Remote file too large")); ws.destroy(); reject(new Error("Remote file too large")); }
       });
       resp.data.on("error", reject);
       ws.on("error", reject);
@@ -502,7 +498,6 @@ ${originalAll}
     const txtName  = `${safeBase}-${requestId}.txt`;
     const docxName = `${safeBase}-${requestId}.docx`;
 
-    // DOCX
     const doc = new Document({
       sections: [{
         children: [
@@ -562,7 +557,6 @@ ${originalAll}
       addStep(requestId, "⚠️ Sheet append failed: " + (e?.message || e));
     }
 
-    // tell PHP actual usage
     await consume({
       event: "transcription.finished",
       status: "succeeded",
@@ -643,7 +637,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// ⬇️ /fetch — accept a link (YouTube / Google Drive public / Dropbox public)
+// /fetch — accept a link (YouTube / Google Drive public / Dropbox public)
 app.post("/fetch", async (req, res) => {
   try {
     const email = String(req.body.email || "").trim();
@@ -673,7 +667,6 @@ app.post("/fetch", async (req, res) => {
     addStep(requestId, "Remote fetch accepted.");
     res.status(202).json({ success:true, accepted:true, requestId });
 
-    // background fetch → process
     setImmediate(async ()=>{
       try {
         const fetched = await downloadToTemp({ kind, url: normalized, requestId });
