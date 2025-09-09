@@ -13,7 +13,7 @@ import mysql from "mysql2/promise";
 import ytdl from "ytdl-core";
 import { execFile } from "child_process";
 import { Document, Packer, Paragraph } from "docx";
-import ytDlp from "yt-dlp-exec";
+import YTDlpWrap from "yt-dlp-wrap"; // ✅ correct ESM import
 
 // ---------- notify PHP (worker-consume.php) ----------
 const CONSUME_URL = process.env.CONSUME_URL || "";
@@ -123,7 +123,6 @@ async function addStep(id, text) {
 async function setJobStatus(id, status, error = null) {
   await db.query("UPDATE jobs SET status = ?, error = ? WHERE requestId = ?", [status, error, id]);
 }
-
 app.get("/status", async (req, res) => {
   const id = (req.query.id || "").toString();
   if (!id) return res.status(400).json({ error: "Missing id" });
@@ -133,7 +132,6 @@ app.get("/status", async (req, res) => {
   j.steps = JSON.parse(j.steps || "[]");
   res.json(j);
 });
-
 function fmtLocalStamp(d) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: LOCAL_TZ,
@@ -214,7 +212,7 @@ async function wavToMp3Filtered(inWav, outMp3, kbps) {
       .outputOptions(["-vn", "-ac", "1", "-ar", "16000", "-b:a", `${kbps}k`, "-codec:a", "libmp3lame"])
       .save(outMp3)
       .on("end", resolve)
-      .on("error, reject");
+      .on("error", reject); // ✅ fixed typo
   });
   return outMp3;
 }
@@ -230,20 +228,14 @@ async function prepareMp3UnderLimit(inMediaPath, requestId) {
     const sz = statBytes(out);
     addStep(requestId, `MP3 ${kb} kbps = ${(sz / 1024 / 1024).toFixed(2)} MB`);
     if (sz <= OPENAI_AUDIO_MAX) {
-      try {
-        fs.unlinkSync(tmpWav);
-      } catch {}
+      try { fs.unlinkSync(tmpWav); } catch {}
       return { path: out, kbps: kb, bytes: sz };
     }
-    try {
-      fs.unlinkSync(out);
-    } catch {}
+    try { fs.unlinkSync(out); } catch {}
   }
   const fallback = inMediaPath + `.24k.mp3`;
   await wavToMp3Filtered(tmpWav, fallback, 24);
-  try {
-    fs.unlinkSync(tmpWav);
-  } catch {}
+  try { fs.unlinkSync(tmpWav); } catch {}
   return { path: fallback, kbps: 24, bytes: statBytes(fallback) };
 }
 async function splitIfNeeded(mp3Path, requestId) {
@@ -266,28 +258,22 @@ async function splitIfNeeded(mp3Path, requestId) {
     .sort();
 }
 
-// ---------- YouTube helpers ----------
+// ---------- YouTube ----------
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36";
+const ytDlpBinaryPath = YTDlpWrap.getBinaryPath(); // ✅ works with default import
 
 function normalizeYouTubeUrl(uString) {
-  // Keep only the video id if both v and list are present (radio/mix fix)
+  // Convert playlist/mix/radio to a plain watch URL with only v and (optional) t
   try {
     const u = new URL(uString);
-    if ((u.hostname.includes("youtube.com") || u.hostname === "youtu.be")) {
-      const v = u.searchParams.get("v");
+    if (u.hostname.includes("youtube.com") || u.hostname === "youtu.be") {
       const t = u.searchParams.get("t") || u.searchParams.get("time_continue");
-      if (v) {
+      let id = u.searchParams.get("v");
+      if (!id && u.hostname === "youtu.be") id = u.pathname.slice(1);
+      if (id) {
         const base = new URL("https://www.youtube.com/watch");
-        base.searchParams.set("v", v);
+        base.searchParams.set("v", id);
         if (t) base.searchParams.set("t", t);
-        return base.toString();
-      }
-      if (u.hostname === "youtu.be") {
-        const id = u.pathname.slice(1);
-        const base = new URL("https://www.youtube.com/watch");
-        if (id) base.searchParams.set("v", id);
-        const t2 = u.searchParams.get("t");
-        if (t2) base.searchParams.set("t", t2);
         return base.toString();
       }
     }
@@ -298,13 +284,12 @@ function normalizeYouTubeUrl(uString) {
 async function downloadYouTube(url, outBase, requestId) {
   const cleaned = normalizeYouTubeUrl(url);
 
-  // Try ytdl-core first (fast path)
+  // Fast path: ytdl-core
   try {
     addStep(requestId, "Fetching from YouTube via ytdl-core …");
     const info = await ytdl.getInfo(cleaned);
     const title = (info?.videoDetails?.title || "youtube").replace(/[^\w.-]+/g, "_").slice(0, 60);
     const out = `${outBase}.webm`;
-
     await new Promise((resolve, reject) => {
       const stream = ytdl(cleaned, {
         quality: "highestaudio",
@@ -326,7 +311,6 @@ async function downloadYouTube(url, outBase, requestId) {
       ws.on("finish", resolve);
       stream.pipe(ws);
     });
-
     return {
       path: out,
       bytes: statBytes(out),
@@ -340,28 +324,41 @@ async function downloadYouTube(url, outBase, requestId) {
     );
   }
 
-  // Robust fallback: yt-dlp (via yt-dlp-exec)
+  // Robust fallback: yt-dlp
   const out = `${outBase}.m4a`;
-  await ytDlp(cleaned, {
-    // bestaudio to m4a if available
-    f: "bestaudio[ext=m4a]/bestaudio/best",
-    o: out,
-    noWarnings: true,
-    restrictFilenames: true,
-    ffmpegLocation: ffmpegStatic,
-    addHeader: [`User-Agent:${UA}`],
-    // Never auto-update in Render
-    noUpdate: true,
-    // Quiet logs
-    q: true,
+  const args = [
+    cleaned,
+    "-f",
+    "bestaudio[ext=m4a]/bestaudio/best",
+    "-o",
+    out,
+    "--no-warnings",
+    "--restrict-filenames",
+    "--ffmpeg-location",
+    ffmpegStatic,
+    "--no-update",
+    "--add-header",
+    `User-Agent:${UA}`,
+  ];
+
+  await new Promise((resolve, reject) => {
+    const yt = new YTDlpWrap(ytDlpBinaryPath).exec(args);
+    let stderr = "";
+    yt.on("ytDlpEvent", () => {}); // keep listener to avoid memory warnings
+    yt.on("error", (err) => reject(err));
+    yt.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`yt-dlp exited with code ${code}. ${stderr}`));
+    });
+    yt.on("stderr", (data) => {
+      stderr += String(data || "");
+    });
   });
 
   const size = statBytes(out);
   if (size <= 0) throw new Error("yt-dlp produced no file");
   if (size > FETCH_MAX_BYTES) {
-    try {
-      fs.unlinkSync(out);
-    } catch {}
+    try { fs.unlinkSync(out); } catch {}
     throw new Error("Remote file too large");
   }
   return {
@@ -374,11 +371,7 @@ async function downloadYouTube(url, outBase, requestId) {
 
 // ---------- link helpers, OpenAI, and main processor logic ----------
 function parseUrlSafe(u) {
-  try {
-    return new URL(String(u));
-  } catch {
-    return null;
-  }
+  try { return new URL(String(u)); } catch { return null; }
 }
 function hostAllowed(u) {
   const h = (u.hostname || "").toLowerCase();
@@ -402,7 +395,6 @@ function normalizeDropbox(urlObj) {
   urlObj.searchParams.set("dl", "1");
   return urlObj.toString();
 }
-
 async function downloadToTemp({ kind, url, requestId }) {
   const tmpBase = `/tmp/${requestId}`;
   if (kind === "youtube") return await downloadYouTube(url, tmpBase, requestId);
@@ -438,12 +430,7 @@ async function downloadToTemp({ kind, url, requestId }) {
       ws.on("finish", resolve);
       resp.data.pipe(ws);
     });
-    return {
-      path: outPath,
-      bytes,
-      originalname: original,
-      mimetype: ct || "application/octet-stream",
-    };
+    return { path: outPath, bytes, originalname: original, mimetype: ct || "application/octet-stream" };
   }
   throw new Error("Unsupported source");
 }
@@ -467,16 +454,14 @@ async function openaiTranscribeVerbose(audioPath, requestId) {
     throw new Error("Transcription failed");
   }
 }
-
 async function zhTwFromOriginalFaithful(originalText, requestId) {
   try {
     addStep(requestId, "Calling GPT 原文→繁中 (faithful) …");
     const systemPrompt = `你是國際會議的專業口筆譯員。請把使用者提供的「原文」完整翻譯成「繁體中文（台灣慣用）」並嚴格遵守：
 1) 忠實轉譯：不可增刪、不可臆測，不加入任何評論；僅做必要語法與詞序調整以使中文通順。
 2) 句序與段落：依原文順序與段落輸出；保留所有重複、口號與語氣詞。
-3) 中英夾雜：凡是非中文的片段（英語、法語、西班牙語、德語、日語、韓語等任何語種的詞句、人名地名、術語）一律翻成中文。不得保留原語言（含英文）單字。
-4) 標點使用中文全形標點。只輸出中文譯文，不要任何說明。
-5) 適用範圍：以上規則（1–4）不論原文語言為何（只要 Whisper 能辨識的語言）皆一體適用；專有名詞採常見中譯或音譯，若無通行譯名則以自然音譯呈現，亦不得夾帶原文括註。`;
+3) 中英夾雜：凡是非中文的片段一律翻成中文。
+4) 標點使用中文全形標點。只輸出中文譯文，不要任何說明。`;
     const r = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       { model: "gpt-4o-mini", temperature: 0, messages: [{ role: "system", content: systemPrompt }, { role: "user", content: originalText || "" }] },
@@ -617,16 +602,11 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     });
   } finally {
     addStep(requestId, "Cleaning up temporary files...");
-    // Remove temp files best-effort
-    try {
-      const uniq = new Set();
-      for (const f of fs.readdirSync("/tmp")) {
-        if (f.startsWith(requestId)) uniq.add(path.join("/tmp", f));
+    for (const f of fs.readdirSync("/tmp")) {
+      if (f.startsWith(requestId)) {
+        try { fs.unlinkSync(path.join("/tmp", f)); } catch {}
       }
-      for (const f of uniq) {
-        try { fs.unlinkSync(f); } catch {}
-      }
-    } catch {}
+    }
   }
 }
 
@@ -638,11 +618,9 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const token = (req.body.token || "").toString();
     if (!email) return res.status(400).json({ error: "Email is required" });
     if (!req.file) return res.status(400).json({ error: "File is required" });
-
     const requestId = crypto.randomUUID();
     await createJob(requestId);
     res.status(202).json({ success: true, accepted: true, requestId });
-
     setImmediate(() =>
       processJob({
         email,
