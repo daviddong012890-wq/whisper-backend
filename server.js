@@ -109,9 +109,62 @@ const pool =
 pool
   .query("SELECT 1")
   .then(() => console.log("✅ DB connectivity OK (Postgres)"))
-  .catch((e) =>
-    console.error("❌ DB connectivity failed:", e.code || "", e.message)
-  );
+  .catch((e) => {
+    console.error("❌ DB connectivity failed:", e.code || "", e.message);
+  });
+
+/** -------------------------------------------------------
+ *  Ensure required tables exist (auto-migrate on boot)
+ *  - jobs           (requestid, status, steps jsonb, error, created_at)
+ *  - transcriptions (columns your code writes to)
+ * ------------------------------------------------------ */
+async function ensureSchema() {
+  // jobs table: unquoted names -> lowercase (requestid)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS jobs (
+      requestid   TEXT PRIMARY KEY,
+      status      TEXT NOT NULL,
+      steps       JSONB NOT NULL DEFAULT '[]'::jsonb,
+      error       TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
+  `);
+
+  // transcriptions table with the columns your inserts expect
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS transcriptions (
+      id                 BIGSERIAL PRIMARY KEY,
+      timestamputc       TIMESTAMPTZ NOT NULL,
+      timestamplocal     TEXT NOT NULL,
+      email              TEXT NOT NULL,
+      jobseconds         INTEGER NOT NULL,
+      cumulativeseconds  INTEGER NOT NULL,
+      minutes            INTEGER NOT NULL,
+      cumulativeminutes  INTEGER NOT NULL,
+      filename           TEXT NOT NULL,
+      filesizemb         NUMERIC(10,2) NOT NULL,
+      language           TEXT NOT NULL,
+      requestid          TEXT NOT NULL,
+      processingms       INTEGER NOT NULL,
+      succeeded          BOOLEAN NOT NULL,
+      errormessage       TEXT NOT NULL,
+      model              TEXT NOT NULL,
+      filetype           TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trans_email ON transcriptions(email);
+    CREATE INDEX IF NOT EXISTS idx_trans_reqid ON transcriptions(requestid);
+    CREATE INDEX IF NOT EXISTS idx_trans_succeeded ON transcriptions(succeeded);
+  `);
+
+  console.log("✅ Schema ready (jobs, transcriptions)");
+}
+
+// init schema at boot (fail fast if cannot create)
+await ensureSchema().catch((e) => {
+  console.error("❌ Schema init failed:", e);
+  process.exit(1);
+});
 
 // ---------- mailer ----------
 const mailer = nodemailer.createTransport({
@@ -168,10 +221,11 @@ function sleep(ms) {
 // ---------- DB helpers (Postgres) ----------
 async function createJob(id) {
   const step = { at: new Date().toISOString(), text: "Job accepted by server." };
-  // Insert as JSONB array with one element
   await pool.query(
-    `INSERT INTO jobs (requestId, status, steps)
-     VALUES ($1, $2, $3::jsonb)`,
+    `INSERT INTO jobs (requestid, status, steps, created_at)
+     VALUES ($1, $2, $3::jsonb, now())
+     ON CONFLICT (requestid)
+     DO UPDATE SET status = EXCLUDED.status, steps = EXCLUDED.steps`,
     [id, "accepted", JSON.stringify([step])]
   );
   console.log(`[${id}] Job created in database.`);
@@ -179,11 +233,10 @@ async function createJob(id) {
 
 async function addStep(id, text) {
   const step = { at: new Date().toISOString(), text };
-  // Append element to jsonb array: steps = steps || [step]
   await pool.query(
     `UPDATE jobs
        SET steps = COALESCE(steps, '[]'::jsonb) || $1::jsonb
-     WHERE requestId = $2`,
+     WHERE requestid = $2`,
     [JSON.stringify([step]), id]
   );
   console.log(`[${id}] ${text}`);
@@ -191,7 +244,7 @@ async function addStep(id, text) {
 
 async function setJobStatus(id, status, error = null) {
   await pool.query(
-    `UPDATE jobs SET status = $1, error = $2 WHERE requestId = $3`,
+    `UPDATE jobs SET status = $1, error = $2 WHERE requestid = $3`,
     [status, error, id]
   );
 }
@@ -201,24 +254,16 @@ app.get("/status", async (req, res) => {
   const id = (req.query.id || "").toString();
   if (!id) return res.status(400).json({ error: "Missing id" });
   const { rows } = await pool.query(
-    `SELECT requestId, status, steps, error, created_at
+    `SELECT requestid, status, steps, error, created_at
        FROM jobs
-      WHERE requestId = $1
+      WHERE requestid = $1
       LIMIT 1`,
     [id]
   );
   const j = rows[0];
   if (!j) return res.status(404).json({ error: "Not found" });
-  // pg returns jsonb already parsed in many clients, but ensure we output array
-  const steps = Array.isArray(j.steps)
-    ? j.steps
-    : (() => {
-        try {
-          return JSON.parse(j.steps || "[]");
-        } catch {
-          return [];
-        }
-      })();
+  const steps =
+    Array.isArray(j.steps) ? j.steps : (() => { try { return JSON.parse(j.steps || "[]"); } catch { return []; } })();
   res.json({ ...j, steps });
 });
 
@@ -293,8 +338,7 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
       .on("error", reject);
   });
   const dir = path.dirname(outPattern);
-  // capture base like `${requestId}.part-`
-  const base = path.basename(outPattern).split("%")[0];
+  const base = path.basename(outPattern).split("%")[0]; // prefix before %03d
   const files = fs
     .readdirSync(dir)
     .filter((n) => n.startsWith(base) && n.endsWith(".mp3"))
@@ -426,11 +470,13 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     jobSeconds = Math.round(jobSeconds);
 
     const minutesForDb = secsToSheetMinutes(jobSeconds);
-    // Here we compute pastSeconds from transcriptions table (Postgres)
+    // cumulative seconds (sum only succeeded jobs)
     let pastSeconds = 0;
     try {
       const { rows } = await pool.query(
-        `SELECT COALESCE(SUM(jobSeconds), 0)::int AS total FROM transcriptions WHERE email = $1 AND succeeded = true`,
+        `SELECT COALESCE(SUM(jobseconds), 0)::int AS total
+           FROM transcriptions
+          WHERE email = $1 AND succeeded = true`,
         [email]
       );
       pastSeconds = Number(rows?.[0]?.total || 0);
@@ -528,10 +574,10 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     try {
       const sql = `
         INSERT INTO transcriptions (
-          timestampUTC, timestampLocal, email,
-          jobSeconds, cumulativeSeconds, minutes, cumulativeMinutes,
-          fileName, fileSizeMB, language, requestId, processingMs,
-          succeeded, errorMessage, model, fileType
+          timestamputc, timestamplocal, email,
+          jobseconds, cumulativeseconds, minutes, cumulativeminutes,
+          filename, filesizemb, language, requestid, processingms,
+          succeeded, errormessage, model, filetype
         )
         VALUES (
           $1, $2, $3, $4, $5, $6, $7,
