@@ -17,6 +17,7 @@ import { Document, Packer, Paragraph } from "docx";
 // ---------- notify PHP (worker-consume.php) ----------
 const CONSUME_URL = process.env.CONSUME_URL || "";
 const WORKER_SHARED_KEY = process.env.WORKER_SHARED_KEY || "";
+const CALLBACK_URL = process.env.CALLBACK_URL || ""; // <-- ADDED
 
 async function consume(payload) {
   if (!CONSUME_URL) return;
@@ -28,6 +29,31 @@ async function consume(payload) {
     console.log("→ consume() POST ok");
   } catch (e) {
     console.error("consume() error:", e?.response?.status || "", e?.message || e);
+  }
+}
+
+// ---------- NEW: notify PHP dashboard (worker-callback.php) ----------
+async function updateStatus(jobId, status, durationSec = 0) {
+  if (!CALLBACK_URL) return;
+  try {
+    await axios.post(
+      CALLBACK_URL,
+      new URLSearchParams({
+        job_id: jobId,
+        status: status,
+        duration_sec: durationSec.toString(),
+      }),
+      {
+        headers: {
+          "X-Worker-Key": WORKER_SHARED_KEY,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        timeout: 10000,
+      }
+    );
+    console.log(`→ updateStatus(${jobId}, ${status}) ok`);
+  } catch (err) {
+    console.error("updateStatus error:", err?.response?.status, err?.message || err);
   }
 }
 
@@ -335,10 +361,14 @@ async function encodeSingleMp3(inPath, outMp3, kbps, requestId) {
       .noVideo()
       .audioFilters(["highpass=f=200", "lowpass=f=3800", "dynaudnorm"])
       .outputOptions([
-        "-ac", "1",
-        "-ar", "16000",
-        "-b:a", `${kbps}k`,
-        "-codec:a", "libmp3lame",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-b:a",
+        `${kbps}k`,
+        "-codec:a",
+        "libmp3lame",
       ])
       .save(outMp3)
       .on("end", resolve)
@@ -353,13 +383,20 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
       .noVideo()
       .audioFilters(["highpass=f=200", "lowpass=f=3800", "dynaudnorm"])
       .outputOptions([
-        "-ac", "1",
-        "-ar", "16000",
-        "-b:a", `${kbps}k`,
-        "-codec:a", "libmp3lame",
-        "-f", "segment",
-        "-segment_time", String(segmentSeconds),
-        "-reset_timestamps", "1",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-b:a",
+        `${kbps}k`,
+        "-codec:a",
+        "libmp3lame",
+        "-f",
+        "segment",
+        "-segment_time",
+        String(segmentSeconds),
+        "-reset_timestamps",
+        "1",
       ])
       .save(outPattern)
       .on("end", resolve)
@@ -418,7 +455,8 @@ async function withRetries(fn, { maxAttempts = 5, baseDelayMs = 700 } = {}) {
     } catch (e) {
       attempt++;
       const s = e?.response?.status;
-      const retriable = s === 429 || (s >= 500 && s < 600) || e.code === "ECONNRESET" || e.code === "ETIMEDOUT";
+      const retriable =
+        s === 429 || (s >= 500 && s < 600) || e.code === "ECONNRESET" || e.code === "ETIMEDOUT";
       if (!retriable || attempt >= maxAttempts) throw e;
       const delay = Math.floor(baseDelayMs * Math.pow(2, attempt - 1) + Math.random() * 250);
       await sleepMs(delay);
@@ -502,6 +540,8 @@ async function gptTranslateFaithful(originalAll, requestId) {
 // ---------- main processor ----------
 async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }) {
   await setJobStatus(requestId, "processing");
+  await updateStatus(requestId, "processing"); // <-- ADDED
+
   addStep(
     requestId,
     `Processing: ${fileMeta.originalname} (${(fileMeta.size / 1024 / 1024).toFixed(2)} MB)`
@@ -626,7 +666,12 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
 
     // email with attachments
     const localStamp = fmtLocalStamp(new Date());
-    const attachmentText = `＝＝ 中文（繁體） ＝＝\n${zhTraditional}\n\n＝＝ 原文 ＝＝\n${originalAll}\n`;
+    const attachmentText = `＝＝ 中文（繁體） ＝＝
+${zhTraditional}
+
+＝＝ 原文 ＝＝
+${originalAll}
+`;
     const safeBase =
       (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
     const txtName = `${safeBase}-${requestId}.txt`;
@@ -656,7 +701,11 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       to: email,
       replyTo: FROM_EMAIL,
       subject: "您的逐字稿（原文與繁體中文）",
-      text: `轉寫已完成 ${localStamp}\n\n本次上傳時長（秒）：${jobSeconds}\n\n（服務單號：${requestId}）`,
+      text: `轉寫已完成 ${localStamp}
+
+本次上傳時長（秒）：${jobSeconds}
+
+（服務單號：${requestId}）`,
       attachments: [
         {
           filename: txtName,
@@ -725,6 +774,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       language: language || "",
       finished_at: new Date().toISOString(),
     });
+    await updateStatus(requestId, "succeeded", jobSeconds); // <-- ADDED
     await setJobStatus(requestId, "done");
     addStep(requestId, "✅ Done");
   } catch (err) {
@@ -745,6 +795,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       finished_at: new Date().toISOString(),
       error: eMsg,
     });
+    await updateStatus(requestId, "processing_fail"); // <-- ADDED
   } finally {
     addStep(requestId, "Cleaning up temporary files...");
     for (const f of Array.from(tempFiles)) {
@@ -807,6 +858,7 @@ app.post(
         console.error(`[${requestId}] Background crash:`, e?.message || e);
         try {
           await setJobStatus(requestId, "error", e?.message || String(e));
+          await updateStatus(requestId, "processing_fail"); // <-- ADDED
         } catch {}
       }
     });
