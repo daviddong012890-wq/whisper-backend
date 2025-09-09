@@ -577,3 +577,11 @@ app.post("/upload", (req, res, next) => {
 app.get("/", (_req, res) => res.send("✅ Whisper backend (upload-only, optimized) running"));
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
+// --- Quick DB password check ---
+db.query("SELECT 1")
+  .then(() => {
+    console.log("✅ DB connectivity OK (username/password/host are correct)");
+  })
+  .catch((e) => {
+    console.error("❌ DB connectivity failed:", e.code || "", e.message);
+  });
