@@ -11,8 +11,11 @@ import nodemailer from "nodemailer";
 import crypto from "crypto";
 import mysql from "mysql2/promise";
 import ytdl from "ytdl-core";
-import { YtDlpNodejs } from "yt-dlp-nodejs"; // <-- CHANGED to the new, modern package
+import { createRequire } from "module"; // Helper to import the new package
 import { Document, Packer, Paragraph } from "docx";
+
+const require = createRequire(import.meta.url); // Create a require function
+const YTDlpWrap = require("yt-dlp-wrap");      // Use it to import the package correctly
 
 // ---------- notify PHP (worker-consume.php) ----------
 const CONSUME_URL = process.env.CONSUME_URL || "";
@@ -72,7 +75,6 @@ const db = mysql.createPool({ host: DB_HOST, user: DB_USER, password: DB_PASS, d
 console.log("✅ Database pool created.");
 const mailer = nodemailer.createTransport({ host: "smtp.gmail.com", port: 465, secure: true, auth: { user: GMAIL_USER, pass: GMAIL_PASS } });
 
-// ... (DB-backed job tracker functions are unchanged)
 async function createJob(id) {
   const steps = [{ at: new Date().toISOString(), text: "Job accepted by server." }];
   await db.query("INSERT INTO jobs (requestId, status, steps) VALUES (?, ?, ?)", [id, 'accepted', JSON.stringify(steps)]);
@@ -95,7 +97,6 @@ app.get("/status", async (req,res)=>{
   j.steps = JSON.parse(j.steps || '[]');
   res.json(j);
 });
-// ... (Time/format and other helper functions are unchanged)
 function fmtLocalStamp(d){
   const parts = new Intl.DateTimeFormat("en-US", { timeZone: LOCAL_TZ, year:"numeric", month:"short", day:"numeric", hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:true }).formatToParts(d);
   let Y,M,D,hh,mm,ss,ap;
@@ -141,7 +142,7 @@ async function splitIfNeeded(mp3Path, requestId){
 
 // ---------- YouTube download (REWRITTEN) ----------
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36";
-const ytdlp = new YtDlpNodejs({ ffmpegPath: ffmpegStatic });
+const ytDlpWrap = new YTDlpWrap(); // Create an instance of the downloader
 
 async function downloadYouTube(url, outBase, requestId){
   // Try ytdl-core first (fast)
@@ -165,31 +166,28 @@ async function downloadYouTube(url, outBase, requestId){
     addStep(requestId, `ytdl-core failed (${e?.statusCode || e?.code || "unknown"}) — falling back to yt-dlp …`);
   }
 
-  // Fallback: The new, stable yt-dlp-nodejs package
+  // Fallback: The stable yt-dlp-wrap package
   const out = `${outBase}.m4a`;
-  const stream = await ytdlp.download(url, {
-    format: 'bestaudio[ext=m4a]/bestaudio/best',
-    output: out,
-    noWarnings: true,
-    restrictFilenames: true,
-    addHeader: `User-Agent:${UA}`
+  await new Promise((resolve, reject) => {
+    ytDlpWrap.exec([
+      url,
+      '-f', 'bestaudio[ext=m4a]/bestaudio/best', // Get best audio, prefer m4a
+      '-o', out,                               // Specify output file path
+      '--no-warnings',
+      '--restrict-filenames',
+      '--add-header', `User-Agent:${UA}`
+    ])
+    .on('close', resolve) // Success
+    .on('error', reject); // Failure
   });
 
-  await new Promise((resolve, reject) => {
-    const ws = fs.createWriteStream(out);
-    stream.on('error', reject);
-    ws.on('error', reject);
-    ws.on('close', resolve);
-    stream.pipe(ws);
-  });
-  
   const size = statBytes(out);
   if (size <= 0) throw new Error("yt-dlp produced no file");
   if (size > FETCH_MAX_BYTES) { try { fs.unlinkSync(out); } catch {} throw new Error("Remote file too large"); }
   return { path: out, bytes: size, originalname: "youtube.m4a", mimetype: "audio/mp4" };
 }
 
-// ... (Link helpers, OpenAI, and main processor logic are unchanged)
+// ---------- link helpers, OpenAI, and main processor logic ----------
 function parseUrlSafe(u){ try { return new URL(String(u)); } catch { return null; } }
 function hostAllowed(u){ const h = (u.hostname || "").toLowerCase(); return ALLOWED_HOSTS.has(h); }
 function detectKind(u){ const h = (u.hostname || "").toLowerCase(); if (h === "youtu.be" || h.endsWith("youtube.com")) return "youtube"; if (h === "drive.google.com") return "gdrive"; if (h === "dropbox.com" || h === "www.dropbox.com" || h === "dl.dropboxusercontent.com") return "dropbox"; return "unknown"; }
@@ -221,13 +219,13 @@ async function downloadToTemp({ kind, url, requestId }){
   }
   throw new Error("Unsupported source");
 }
-async function openaiTranscribeVerbose(audioPath, requestId){ try { addStep(requestId, "Calling Whisper /transcriptions …"); const fd = new FormData(); fd.append("file", fs.createReadStream(audioPath), { filename: path.basename(audioPath) }); fd.append("model", "whisper-1"); fd.append("response_format", "verbose_json"); fd.append("temperature", "0"); const r = await axios.post("https://api.openai.com/v1/audio/transcriptions", fd, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() }, maxBodyLength: Infinity }); addStep(requestId, "Transcription done."); return r.data; } catch (err) { logAxiosError(`[${requestId}] Whisper transcribe`, err); throw new Error("Transcription failed"); } }
+async function openaiTranscribeVerbose(audioPath, requestId){ try { addStep(requestId, "Calling Whisper /transcriptions …"); const fd = new FormData(); fd.append("file", fs.createReadStream(audioPath), { filename: path.basename(audioPath) }); fd.append("model", "whisper-1"); fd.append("response_format", "verbose_json"); fd.append("temperature", "0"); const r = await axios.post("https://api.openai.com/v1/audio/transcriptions", fd, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() }, maxBodyLength: Infinity }); addStep(requestId, "Transcription done."); return r.data; } catch (err) { console.error(`[${requestId}] Whisper transcribe`, err); throw new Error("Transcription failed"); } }
 async function zhTwFromOriginalFaithful(originalText, requestId){ try { addStep(requestId, "Calling GPT 原文→繁中 (faithful) …"); const systemPrompt = `你是國際會議的專業口筆譯員。請把使用者提供的「原文」完整翻譯成「繁體中文（台灣慣用）」並嚴格遵守：
 1) 忠實轉譯：不可增刪、不可臆測，不加入任何評論；僅做必要語法與詞序調整以使中文通順。
 2) 句序與段落：依原文順序與段落輸出；保留所有重複、口號與語氣詞。
 3) 中英夾雜：凡是非中文的片段（英語、法語、西班牙語、德語、日語、韓語等任何語種的詞句、人名地名、術語）一律翻成中文。不得保留原語言（含英文）單字。
 4) 標點使用中文全形標點。只輸出中文譯文，不要任何說明。
-5) 適用範圍：以上規則（1–4）不論原文語言為何（只要 Whisper 能辨識的語言）皆一體適用；專有名詞採常見中譯或音譯，若無通行譯名則以自然音譯呈現，亦不得夾帶原文括註。`; const r = await axios.post( "https://api.openai.com/v1/chat/completions", { model:"gpt-4o-mini", temperature:0, messages:[ { role:"system", content: systemPrompt }, { role:"user", content: originalText || "" } ]}, { headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` } } ); addStep(requestId, "繁中 done."); return r.data?.choices?.[0]?.message?.content?.trim() || ""; } catch (err) { logAxiosError(`[${requestId}] GPT 原文→繁中`, err); throw new Error("Traditional Chinese translation failed"); } }
+5) 適用範圍：以上規則（1–4）不論原文語言為何（只要 Whisper 能辨識的語言）皆一體適用；專有名詞採常見中譯或音譯，若無通行譯名則以自然音譯呈現，亦不得夾帶原文括註。`; const r = await axios.post( "https://api.openai.com/v1/chat/completions", { model:"gpt-4o-mini", temperature:0, messages:[ { role:"system", content: systemPrompt }, { role:"user", content: originalText || "" } ]}, { headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` } } ); addStep(requestId, "繁中 done."); return r.data?.choices?.[0]?.message?.content?.trim() || ""; } catch (err) { console.error(`[${requestId}] GPT 原文→繁中`, err); throw new Error("Traditional Chinese translation failed"); } }
 async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }){
   await setJobStatus(requestId, 'processing');
   addStep(requestId, `Processing: ${fileMeta.originalname} (${(fileMeta.size/1024/1024).toFixed(2)} MB)`);
