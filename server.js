@@ -9,6 +9,8 @@ import axios from "axios";
 import FormData from "form-data";
 import nodemailer from "nodemailer";
 import crypto from "crypto";
+import http from "http";
+import https from "https";
 import { Pool } from "pg";
 import { Document, Packer, Paragraph } from "docx";
 
@@ -47,7 +49,9 @@ app.options("*", cors());
 app.use(express.json({ limit: "1mb" }));
 
 // ===== Upload-only mode =====
-const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 1.5 * 1024 * 1024 * 1024); // 1.5 GB default
+const MAX_UPLOAD_BYTES = Number(
+  process.env.MAX_UPLOAD_BYTES || 1.5 * 1024 * 1024 * 1024
+); // 1.5 GB default
 const upload = multer({
   dest: "/tmp",
   limits: { fileSize: MAX_UPLOAD_BYTES },
@@ -218,6 +222,22 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// ---------- keep-alive axios for OpenAI (reduces "socket hang up") ----------
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
+
+const axiosOpenAI = axios.create({
+  httpAgent,
+  httpsAgent,
+  timeout: 120000, // 120s hard timeout
+  maxContentLength: Infinity,
+  maxBodyLength: Infinity,
+  headers: {
+    Connection: "keep-alive",
+    Accept: "application/json",
+  },
+});
+
 // ---------- DB helpers (Postgres) ----------
 async function createJob(id) {
   const step = { at: new Date().toISOString(), text: "Job accepted by server." };
@@ -249,7 +269,7 @@ async function setJobStatus(id, status, error = null) {
   );
 }
 
-// status endpoint (unchanged shape)
+// status endpoint
 app.get("/status", async (req, res) => {
   const id = (req.query.id || "").toString();
   if (!id) return res.status(400).json({ error: "Missing id" });
@@ -263,7 +283,15 @@ app.get("/status", async (req, res) => {
   const j = rows[0];
   if (!j) return res.status(404).json({ error: "Not found" });
   const steps =
-    Array.isArray(j.steps) ? j.steps : (() => { try { return JSON.parse(j.steps || "[]"); } catch { return []; } })();
+    Array.isArray(j.steps)
+      ? j.steps
+      : (() => {
+          try {
+            return JSON.parse(j.steps || "[]");
+          } catch {
+            return [];
+          }
+        })();
   res.json({ ...j, steps });
 });
 
@@ -279,7 +307,7 @@ function ffprobeDurationSeconds(filePath) {
 
 // ---------- bitrate planning ----------
 function estimateSizeBytes(seconds, kbps) {
-  return Math.ceil(seconds * (kbps * 1000 / 8));
+  return Math.ceil(seconds * (kbps * 1000) / 8);
 }
 function chooseBitrateAndSplit(seconds, candidateKbps = [96, 64, 48, 32, 24, 16]) {
   for (const kb of candidateKbps) {
@@ -295,7 +323,7 @@ function chooseBitrateAndSplit(seconds, candidateKbps = [96, 64, 48, 32, 24, 16]
   };
 }
 function computeSegmentSeconds(kbps) {
-  const seconds = Math.floor(TARGET_MAX_BYTES / (kbps * 1000 / 8));
+  const seconds = Math.floor(TARGET_MAX_BYTES / ((kbps * 1000) / 8));
   return Math.max(MIN_SEG_SECONDS, Math.min(MAX_SEG_SECONDS, seconds || DEFAULT_SEG_SECONDS));
 }
 
@@ -347,7 +375,7 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
   return files;
 }
 
-// ---------- OpenAI ----------
+// ---------- OpenAI (Whisper) ----------
 async function openaiTranscribeVerbose(audioPath, requestId) {
   try {
     const fd = new FormData();
@@ -357,32 +385,40 @@ async function openaiTranscribeVerbose(audioPath, requestId) {
     fd.append("model", "whisper-1");
     fd.append("response_format", "verbose_json");
     fd.append("temperature", "0");
-    const r = await axios.post(
+    const r = await axiosOpenAI.post(
       "https://api.openai.com/v1/audio/transcriptions",
       fd,
       {
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
-        maxBodyLength: Infinity,
-        timeout: 300000,
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          ...fd.getHeaders(),
+        },
       }
     );
     return r.data;
   } catch (err) {
-    console.error(`[${requestId}] Whisper transcribe error:`, err?.response?.status, err?.message);
+    console.error(
+      `[${requestId}] Whisper transcribe error:`,
+      err?.response?.status,
+      err?.message
+    );
     throw err;
   }
 }
 
-// ---------- bounded concurrency + retries ----------
-function sleepMs(ms) { return new Promise(r => setTimeout(r, ms)); }
+// ---------- retries & bounded concurrency ----------
+function sleepMs(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 async function withRetries(fn, { maxAttempts = 5, baseDelayMs = 700 } = {}) {
   let attempt = 0;
   while (true) {
-    try { return await fn(); }
-    catch (e) {
+    try {
+      return await fn();
+    } catch (e) {
       attempt++;
       const s = e?.response?.status;
-      const retriable = s === 429 || (s >= 500 && s < 600);
+      const retriable = s === 429 || (s >= 500 && s < 600) || e.code === "ECONNRESET" || e.code === "ETIMEDOUT";
       if (!retriable || attempt >= maxAttempts) throw e;
       const delay = Math.floor(baseDelayMs * Math.pow(2, attempt - 1) + Math.random() * 250);
       await sleepMs(delay);
@@ -391,27 +427,85 @@ async function withRetries(fn, { maxAttempts = 5, baseDelayMs = 700 } = {}) {
 }
 async function runBounded(tasks, limit = 3) {
   const results = new Array(tasks.length);
-  let next = 0, active = 0;
+  let next = 0,
+    active = 0;
   return new Promise((resolve, reject) => {
     const launch = () => {
       if (next >= tasks.length && active === 0) return resolve(results);
       while (active < limit && next < tasks.length) {
-        const idx = next++; active++;
+        const idx = next++;
+        active++;
         Promise.resolve()
           .then(() => tasks[idx]())
-          .then((r) => { results[idx] = r; })
+          .then((r) => {
+            results[idx] = r;
+          })
           .catch(reject)
-          .finally(() => { active--; launch(); });
+          .finally(() => {
+            active--;
+            launch();
+          });
       }
     };
     launch();
   });
 }
 
+// ---------- GPT translation (multilingual → zh-TW, robust) ----------
+async function gptTranslateFaithful(originalAll, requestId) {
+  const systemPrompt = `你是國際會議的一線口筆譯員。請把使用者提供的「原文」完整翻譯成「繁體中文（台灣慣用）」並嚴格遵守：
+
+1) 忠實轉譯：不得增刪、不得臆測，不加入任何評論；僅做必要語序與語法調整，使中文可讀但不意譯。
+2) 句序與段落：依原文的順序與分段輸出；保留重複、口頭語與語氣詞（如「嗯」「呃」），除非影響理解才可輕微平順化。
+3) 多語切換：不論原文出現哪些語言（如英文、西文、法文、德文、中文等），一律譯為繁體中文。
+   - 專有名詞與常見譯名：使用台灣慣用或通行的中文譯名。
+   - 若無固定譯名：採音譯或意譯，並在「首次出現」於中文後加上原文括號，例如：桑德拉（Sandra）、哥倫比亞大學（Columbia University）。
+4) 數字與單位：數字使用阿拉伯數字；度量衡、貨幣等採台灣常用寫法（公里、公斤、美元…）。
+5) 標點：使用中文全形標點。
+6) 保留不應翻的內容：網址、電子郵件、檔名、程式碼片段、指令、模型名稱等以原樣保留（可配合中文標點）。
+7) 只輸出譯文正文：不要任何說明、標題或註解；不要摘要或重寫。
+8) 若原文本身是中文：統一為台灣慣用詞與全形標點，避免過度改寫。
+
+請直接輸出最終譯文。`;
+
+  const payload = {
+    model: "gpt-4o-mini",
+    temperature: 0,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: originalAll || "" },
+    ],
+  };
+
+  const resp = await withRetries(
+    () =>
+      axiosOpenAI.post("https://api.openai.com/v1/chat/completions", payload, {
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+        validateStatus: (s) => s >= 200 && s < 500,
+      }),
+    { maxAttempts: 5, baseDelayMs: 800 }
+  ).catch((err) => {
+    const s = err?.response?.status;
+    const d = err?.response?.data;
+    addStep(
+      requestId,
+      `GPT error ${s || "no-status"} ${
+        typeof d === "string" ? d.slice(0, 180) : JSON.stringify(d || {}).slice(0, 180)
+      }`
+    );
+    throw err;
+  });
+
+  return resp?.data?.choices?.[0]?.message?.content?.trim() || "";
+}
+
 // ---------- main processor ----------
 async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }) {
   await setJobStatus(requestId, "processing");
-  addStep(requestId, `Processing: ${fileMeta.originalname} (${(fileMeta.size / 1024 / 1024).toFixed(2)} MB)`);
+  addStep(
+    requestId,
+    `Processing: ${fileMeta.originalname} (${(fileMeta.size / 1024 / 1024).toFixed(2)} MB)`
+  );
 
   const tempFiles = new Set([inputPath]);
   const started = Date.now();
@@ -426,7 +520,10 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     addStep(requestId, `Detected duration: ${Math.round(durationSec)}s`);
 
     const { kbps, needsSplit } = chooseBitrateAndSplit(durationSec);
-    addStep(requestId, `Chosen bitrate: ${kbps} kbps; ${needsSplit ? "will segment" : "single file"}.`);
+    addStep(
+      requestId,
+      `Chosen bitrate: ${kbps} kbps; ${needsSplit ? "will segment" : "single file"}.`
+    );
 
     let parts = [];
     const tmpBase = `/tmp/${requestId}`;
@@ -438,7 +535,9 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       addStep(requestId, `Encoded size: ${(sz / 1024 / 1024).toFixed(2)} MB`);
       if (sz > OPENAI_AUDIO_MAX) {
         addStep(requestId, "Single file still >25MB — encoding again with segmentation …");
-        try { fs.unlinkSync(singleOut); } catch {}
+        try {
+          fs.unlinkSync(singleOut);
+        } catch {}
         tempFiles.delete(singleOut);
         const segSec = computeSegmentSeconds(kbps);
         const pattern = `${tmpBase}.part-%03d.mp3`;
@@ -470,6 +569,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     jobSeconds = Math.round(jobSeconds);
 
     const minutesForDb = secsToSheetMinutes(jobSeconds);
+
     // cumulative seconds (sum only succeeded jobs)
     let pastSeconds = 0;
     try {
@@ -492,10 +592,13 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     const concurrency = Number(process.env.WHISPER_CONCURRENCY || 3);
     const tasks = parts.map((filePath, idx) => async () => {
       addStep(requestId, `Part ${idx + 1}/${parts.length} → start`);
-      const res = await withRetries(() => openaiTranscribeVerbose(filePath, requestId), {
-        maxAttempts: 5,
-        baseDelayMs: 700,
-      });
+      const res = await withRetries(
+        () => openaiTranscribeVerbose(filePath, requestId),
+        {
+          maxAttempts: 5,
+          baseDelayMs: 700,
+        }
+      );
       addStep(requestId, `Part ${idx + 1}/${parts.length} → done`);
       return res;
     });
@@ -507,27 +610,19 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       originalAll += (originalAll ? "\n\n" : "") + (verbose?.text || "");
     }
 
-    // zh-TW faithful translation
-    addStep(requestId, "Calling GPT 原文→繁中 (faithful) …");
-    const systemPrompt = `你是國際會議的專業口筆譯員。請把使用者提供的「原文」完整翻譯成「繁體中文（台灣慣用）」並嚴格遵守：
-1) 忠實轉譯：不可增刪、不可臆測，不加入任何評論；僅做必要語法與詞序調整以使中文通順。
-2) 句序與段落：依原文順序與段落輸出；保留所有重複、口號與語氣詞。
-3) 中英夾雜：凡是非中文的片段一律翻成中文。
-4) 標點使用中文全形標點。只輸出中文譯文，不要任何說明。`;
-    const r = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        temperature: 0,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: originalAll || "" },
-        ],
-      },
-      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
-    );
-    const zhTraditional = r.data?.choices?.[0]?.message?.content?.trim() || "";
-    addStep(requestId, "繁中 done.");
+    // zh-TW faithful translation (multilingual) — robust against socket hangups
+    addStep(requestId, "Calling GPT 原文→繁中 (faithful, multilingual) …");
+    let zhTraditional = "";
+    try {
+      // If you fear extremely long prompts, you can cap length:
+      // const inputForGpt = (originalAll || "").slice(0, 20000);
+      const inputForGpt = originalAll || "";
+      zhTraditional = await gptTranslateFaithful(inputForGpt, requestId);
+      addStep(requestId, "繁中 done.");
+    } catch (_) {
+      addStep(requestId, "⚠️ GPT translation failed — sending original only.");
+      zhTraditional = "";
+    }
 
     // email with attachments
     const localStamp = fmtLocalStamp(new Date());
@@ -541,10 +636,14 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
         {
           children: [
             new Paragraph("＝＝ 中文（繁體） ＝＝"),
-            ...String(zhTraditional || "").split("\n").map((line) => new Paragraph(line)),
+            ...String(zhTraditional || "")
+              .split("\n")
+              .map((line) => new Paragraph(line)),
             new Paragraph(""),
             new Paragraph("＝＝ 原文 ＝＝"),
-            ...String(originalAll || "").split("\n").map((line) => new Paragraph(line)),
+            ...String(originalAll || "")
+              .split("\n")
+              .map((line) => new Paragraph(line)),
           ],
         },
       ],
@@ -559,7 +658,11 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       subject: "您的逐字稿（原文與繁體中文）",
       text: `轉寫已完成 ${localStamp}\n\n本次上傳時長（秒）：${jobSeconds}\n\n（服務單號：${requestId}）`,
       attachments: [
-        { filename: txtName, content: attachmentText, contentType: "text/plain; charset=utf-8" },
+        {
+          filename: txtName,
+          content: attachmentText,
+          contentType: "text/plain; charset=utf-8",
+        },
         {
           filename: docxName,
           content: docxBuffer,
@@ -661,7 +764,9 @@ app.post(
         console.error("[/upload] Multer LIMIT_FILE_SIZE:", err);
         return res
           .status(413)
-          .json({ error: `File too large. Max ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB.` });
+          .json({
+            error: `File too large. Max ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB.`,
+          });
       }
       if (err) {
         console.error("[/upload] Multer error:", err);
@@ -685,7 +790,10 @@ app.post(
         try {
           await createJob(requestId);
         } catch (dbErr) {
-          console.error(`[${requestId}] createJob DB error (continuing):`, dbErr?.message || dbErr);
+          console.error(
+            `[${requestId}] createJob DB error (continuing):`,
+            dbErr?.message || dbErr
+          );
         }
         await processJob({
           email,
@@ -697,12 +805,16 @@ app.post(
         });
       } catch (e) {
         console.error(`[${requestId}] Background crash:`, e?.message || e);
-        try { await setJobStatus(requestId, "error", e?.message || String(e)); } catch {}
+        try {
+          await setJobStatus(requestId, "error", e?.message || String(e));
+        } catch {}
       }
     });
   }
 );
 
-app.get("/", (_req, res) => res.send("✅ Whisper backend (upload-only, Postgres) running"));
+app.get("/", (_req, res) =>
+  res.send("✅ Whisper backend (upload-only, Postgres) running")
+);
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
