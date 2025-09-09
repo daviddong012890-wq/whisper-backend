@@ -852,7 +852,8 @@ app.post(
     if (!email) return res.status(400).json({ error: "Email is required" });
     if (!req.file) return res.status(400).json({ error: "File is required" });
 
-    const requestId = crypto.randomUUID();
+    const requestId =
+  (req.body?.request_id || "").toString().trim() || crypto.randomUUID();
 
     // Respond first so frontend doesn't see DB blips
     res.status(202).json({ success: true, accepted: true, requestId });
