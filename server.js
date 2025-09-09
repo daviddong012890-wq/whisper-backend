@@ -10,10 +10,7 @@ import FormData from "form-data";
 import nodemailer from "nodemailer";
 import crypto from "crypto";
 import mysql from "mysql2/promise";
-import ytdl from "ytdl-core";
-import { execFile } from "child_process";
 import { Document, Packer, Paragraph } from "docx";
-import YTDlpWrap from "yt-dlp-wrap"; // ✅ correct ESM import
 
 // ---------- notify PHP (worker-consume.php) ----------
 const CONSUME_URL = process.env.CONSUME_URL || "";
@@ -48,7 +45,18 @@ app.use(
 );
 app.options("*", cors());
 app.use(express.json({ limit: "1mb" }));
-const upload = multer({ dest: "/tmp" });
+
+// ===== Upload-only mode =====
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 1.5 * 1024 * 1024 * 1024); // default 1.5 GB
+const upload = multer({
+  dest: "/tmp",
+  limits: { fileSize: MAX_UPLOAD_BYTES },
+  fileFilter: (_req, file, cb) => {
+    const ok = (file.mimetype || "").startsWith("audio/") || (file.mimetype || "").startsWith("video/");
+    if (!ok) return cb(new Error("Only audio/video files are allowed."));
+    cb(null, true);
+  },
+});
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
 // ---------- env checks ----------
@@ -69,18 +77,6 @@ if (!OPENAI_API_KEY) fatal("Missing OPENAI_API_KEY");
 if (!GMAIL_USER || !GMAIL_PASS) fatal("Missing GMAIL_USER or GMAIL_PASS");
 if (!DB_HOST || !DB_USER || !DB_PASS || !DB_NAME) fatal("Missing Database credentials");
 
-const FETCH_MAX_BYTES = Number(process.env.FETCH_MAX_BYTES || 1.5 * 1024 * 1024 * 1024);
-const ALLOWED_HOSTS = new Set([
-  "youtube.com",
-  "www.youtube.com",
-  "m.youtube.com",
-  "music.youtube.com",
-  "youtu.be",
-  "drive.google.com",
-  "dropbox.com",
-  "www.dropbox.com",
-  "dl.dropboxusercontent.com",
-]);
 const FROM_EMAIL = process.env.FROM_EMAIL || GMAIL_USER;
 const FROM_NAME = process.env.FROM_NAME || "逐字稿產生器";
 
@@ -102,36 +98,16 @@ const mailer = nodemailer.createTransport({
   auth: { user: GMAIL_USER, pass: GMAIL_PASS },
 });
 
-// ---------- helpers ----------
-async function createJob(id) {
-  const steps = [{ at: new Date().toISOString(), text: "Job accepted by server." }];
-  await db.query("INSERT INTO jobs (requestId, status, steps) VALUES (?, ?, ?)", [
-    id,
-    "accepted",
-    JSON.stringify(steps),
-  ]);
-  console.log(`[${id}] Job created in database.`);
+// ---------- small utils ----------
+const OPENAI_AUDIO_MAX = 25 * 1024 * 1024; // 25 MB hard API cap
+const TARGET_MAX_BYTES = 24 * 1024 * 1024; // aim slightly under to be safe
+const MIN_SEG_SECONDS = 420;   // 7 min lower bound
+const MAX_SEG_SECONDS = 900;   // 15 min upper bound
+const DEFAULT_SEG_SECONDS = 900;
+
+function statBytes(p) {
+  try { return fs.statSync(p).size; } catch { return 0; }
 }
-async function addStep(id, text) {
-  const step = { at: new Date().toISOString(), text };
-  await db.query(
-    "UPDATE jobs SET steps = JSON_ARRAY_APPEND(steps, '$', CAST(? AS JSON)) WHERE requestId = ?",
-    [JSON.stringify(step), id]
-  );
-  console.log(`[${id}] ${text}`);
-}
-async function setJobStatus(id, status, error = null) {
-  await db.query("UPDATE jobs SET status = ?, error = ? WHERE requestId = ?", [status, error, id]);
-}
-app.get("/status", async (req, res) => {
-  const id = (req.query.id || "").toString();
-  if (!id) return res.status(400).json({ error: "Missing id" });
-  const [rows] = await db.query("SELECT * FROM jobs WHERE requestId = ?", [id]);
-  const j = rows[0];
-  if (!j) return res.status(404).json({ error: "Not found" });
-  j.steps = JSON.parse(j.steps || "[]");
-  res.json(j);
-});
 function fmtLocalStamp(d) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: LOCAL_TZ,
@@ -158,27 +134,34 @@ function fmtLocalStamp(d) {
 function secsToSheetMinutes(sec) {
   return Math.max(1, Math.ceil((sec || 0) / 60));
 }
-async function getPastSecondsForEmail(email) {
-  try {
-    const [rows] = await db.query(
-      "SELECT SUM(jobSeconds) as totalSeconds FROM transcriptions WHERE email = ? AND succeeded = 1",
-      [email]
-    );
-    return Number(rows[0]?.totalSeconds) || 0;
-  } catch (e) {
-    console.error("⚠️ getPastSecondsForEmail DB error:", e.message || e);
-    return 0;
-  }
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
-const OPENAI_AUDIO_MAX = 25 * 1024 * 1024;
-function statBytes(p) {
-  try {
-    return fs.statSync(p).size;
-  } catch {
-    return 0;
-  }
+
+// ---------- DB logging ----------
+async function createJob(id) {
+  const steps = [{ at: new Date().toISOString(), text: "Job accepted by server." }];
+  await db.query("INSERT INTO jobs (requestId, status, steps) VALUES (?, ?, ?)", [
+    id,
+    "accepted",
+    JSON.stringify(steps),
+  ]);
+  console.log(`[${id}] Job created in database.`);
 }
-function getSecondsOne(filePath) {
+async function addStep(id, text) {
+  const step = { at: new Date().toISOString(), text };
+  await db.query(
+    "UPDATE jobs SET steps = JSON_ARRAY_APPEND(steps, '$', CAST(? AS JSON)) WHERE requestId = ?",
+    [JSON.stringify(step), id]
+  );
+  console.log(`[${id}] ${text}`);
+}
+async function setJobStatus(id, status, error = null) {
+  await db.query("UPDATE jobs SET status = ?, error = ? WHERE requestId = ?", [status, error, id]);
+}
+
+// ---------- media analysis ----------
+function ffprobeDurationSeconds(filePath) {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, meta) => {
       if (err) return reject(err);
@@ -186,258 +169,87 @@ function getSecondsOne(filePath) {
     });
   });
 }
-async function sumSeconds(paths) {
-  let t = 0;
-  for (const p of paths) t += await getSecondsOne(p);
-  return Math.round(t);
+
+// ---------- bitrate planning ----------
+/**
+ * Estimate bytes for CBR-style encoding (rough) to decide bitrate & splitting.
+ * bytes ≈ seconds * (kbps / 8 * 1000)
+ */
+function estimateSizeBytes(seconds, kbps) {
+  return Math.ceil(seconds * (kbps * 1000 / 8));
 }
-async function extractToWav(inPath, outPath) {
+
+/**
+ * Choose a bitrate (from candidates) to keep whole file under TARGET_MAX_BYTES if possible.
+ * Returns the chosen kbps and whether we expect to need splitting.
+ */
+function chooseBitrateAndSplit(seconds, candidateKbps = [96, 64, 48, 32, 24, 16]) {
+  for (const kb of candidateKbps) {
+    const est = estimateSizeBytes(seconds, kb);
+    if (est <= TARGET_MAX_BYTES) {
+      return { kbps: kb, needsSplit: false, estBytes: est };
+    }
+  }
+  // Even the smallest bitrate would exceed the target: we'll encode & segment.
+  return { kbps: candidateKbps[candidateKbps.length - 1], needsSplit: true, estBytes: estimateSizeBytes(seconds, candidateKbps[candidateKbps.length - 1]) };
+}
+
+/**
+ * Compute segment_time (seconds) to target ~TARGET_MAX_BYTES per part at chosen kbps.
+ */
+function computeSegmentSeconds(kbps) {
+  const seconds = Math.floor(TARGET_MAX_BYTES / (kbps * 1000 / 8));
+  return Math.max(MIN_SEG_SECONDS, Math.min(MAX_SEG_SECONDS, seconds || DEFAULT_SEG_SECONDS));
+}
+
+// ---------- single-pass encode helpers ----------
+/**
+ * Single-pass: source -> filters -> MP3 at kbps -> one output file.
+ */
+async function encodeSingleMp3(inPath, outMp3, kbps, requestId) {
+  addStep(requestId, `Encode MP3 @ ${kbps} kbps (single file)…`);
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(16000)
-      .format("wav")
-      .save(outPath)
-      .on("end", resolve)
-      .on("error", reject);
-  });
-  return outPath;
-}
-async function wavToMp3Filtered(inWav, outMp3, kbps) {
-  await new Promise((resolve, reject) => {
-    ffmpeg(inWav)
       .audioFilters(["highpass=f=200", "lowpass=f=3800", "dynaudnorm"])
-      .outputOptions(["-vn", "-ac", "1", "-ar", "16000", "-b:a", `${kbps}k`, "-codec:a", "libmp3lame"])
+      .outputOptions(["-ac", "1", "-ar", "16000", "-b:a", `${kbps}k`, "-codec:a", "libmp3lame"])
       .save(outMp3)
       .on("end", resolve)
-      .on("error", reject); // ✅ fixed typo
+      .on("error", reject);
   });
   return outMp3;
 }
-async function prepareMp3UnderLimit(inMediaPath, requestId) {
-  const tmpWav = inMediaPath + ".clean.wav";
-  addStep(requestId, "Extracting audio → WAV …");
-  await extractToWav(inMediaPath, tmpWav);
-  const ladder = [64, 48, 32, 24];
-  for (const kb of ladder) {
-    const out = inMediaPath + `.${kb}k.mp3`;
-    addStep(requestId, `Encode MP3 ${kb} kbps …`);
-    await wavToMp3Filtered(tmpWav, out, kb);
-    const sz = statBytes(out);
-    addStep(requestId, `MP3 ${kb} kbps = ${(sz / 1024 / 1024).toFixed(2)} MB`);
-    if (sz <= OPENAI_AUDIO_MAX) {
-      try { fs.unlinkSync(tmpWav); } catch {}
-      return { path: out, kbps: kb, bytes: sz };
-    }
-    try { fs.unlinkSync(out); } catch {}
-  }
-  const fallback = inMediaPath + `.24k.mp3`;
-  await wavToMp3Filtered(tmpWav, fallback, 24);
-  try { fs.unlinkSync(tmpWav); } catch {}
-  return { path: fallback, kbps: 24, bytes: statBytes(fallback) };
-}
-async function splitIfNeeded(mp3Path, requestId) {
-  if (statBytes(mp3Path) <= OPENAI_AUDIO_MAX) return [mp3Path];
-  addStep(requestId, "File still >25MB — segmenting …");
-  const dir = path.dirname(mp3Path);
-  const base = path.basename(mp3Path, ".mp3");
-  const pattern = path.join(dir, `${base}.part-%03d.mp3`);
+
+/**
+ * Single-pass: source -> filters -> MP3 at kbps -> segmented parts.
+ * Returns sorted array of part paths.
+ */
+async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, requestId) {
+  addStep(requestId, `Encode+Segment MP3 @ ${kbps} kbps, ~${segmentSeconds}s/part…`);
   await new Promise((resolve, reject) => {
-    ffmpeg(mp3Path)
-      .outputOptions(["-f", "segment", "-segment_time", "900", "-reset_timestamps", "1"])
-      .save(pattern)
+    ffmpeg(inPath)
+      .noVideo()
+      .audioFilters(["highpass=f=200", "lowpass=f=3800", "dynaudnorm"])
+      .outputOptions([
+        "-ac", "1", "-ar", "16000", "-b:a", `${kbps}k`, "-codec:a", "libmp3lame",
+        "-f", "segment", "-segment_time", String(segmentSeconds), "-reset_timestamps", "1",
+      ])
+      .save(outPattern)
       .on("end", resolve)
       .on("error", reject);
   });
-  return fs
-    .readdirSync(dir)
-    .filter((n) => n.startsWith(`${base}.part-`) && n.endsWith(".mp3"))
+  const dir = path.dirname(outPattern);
+  const base = path.basename(outPattern).replace(/%0?2?d\.mp3$/i, ""); // remove pattern suffix if present
+  const files = fs.readdirSync(dir)
+    .filter((n) => n.startsWith(base) && /\.mp3$/i.test(n))
     .map((n) => path.join(dir, n))
     .sort();
+  return files;
 }
 
-// ---------- YouTube ----------
-const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36";
-const ytDlpBinaryPath = YTDlpWrap.getBinaryPath(); // ✅ works with default import
-
-function normalizeYouTubeUrl(uString) {
-  // Convert playlist/mix/radio to a plain watch URL with only v and (optional) t
-  try {
-    const u = new URL(uString);
-    if (u.hostname.includes("youtube.com") || u.hostname === "youtu.be") {
-      const t = u.searchParams.get("t") || u.searchParams.get("time_continue");
-      let id = u.searchParams.get("v");
-      if (!id && u.hostname === "youtu.be") id = u.pathname.slice(1);
-      if (id) {
-        const base = new URL("https://www.youtube.com/watch");
-        base.searchParams.set("v", id);
-        if (t) base.searchParams.set("t", t);
-        return base.toString();
-      }
-    }
-  } catch {}
-  return uString;
-}
-
-async function downloadYouTube(url, outBase, requestId) {
-  const cleaned = normalizeYouTubeUrl(url);
-
-  // Fast path: ytdl-core
-  try {
-    addStep(requestId, "Fetching from YouTube via ytdl-core …");
-    const info = await ytdl.getInfo(cleaned);
-    const title = (info?.videoDetails?.title || "youtube").replace(/[^\w.-]+/g, "_").slice(0, 60);
-    const out = `${outBase}.webm`;
-    await new Promise((resolve, reject) => {
-      const stream = ytdl(cleaned, {
-        quality: "highestaudio",
-        requestOptions: { headers: { "User-Agent": UA } },
-        highWaterMark: 1 << 25,
-      });
-      let bytes = 0;
-      const ws = fs.createWriteStream(out);
-      stream.on("progress", (_c, chunkLen) => {
-        bytes += chunkLen;
-        if (bytes > FETCH_MAX_BYTES) {
-          stream.destroy();
-          ws.destroy();
-          reject(new Error("Remote file too large"));
-        }
-      });
-      stream.on("error", reject);
-      ws.on("error", reject);
-      ws.on("finish", resolve);
-      stream.pipe(ws);
-    });
-    return {
-      path: out,
-      bytes: statBytes(out),
-      originalname: `${title}.webm`,
-      mimetype: "video/webm",
-    };
-  } catch (e) {
-    addStep(
-      requestId,
-      `ytdl-core failed (${e?.statusCode || e?.code || e?.message || "unknown"}) — using yt-dlp …`
-    );
-  }
-
-  // Robust fallback: yt-dlp
-  const out = `${outBase}.m4a`;
-  const args = [
-    cleaned,
-    "-f",
-    "bestaudio[ext=m4a]/bestaudio/best",
-    "-o",
-    out,
-    "--no-warnings",
-    "--restrict-filenames",
-    "--ffmpeg-location",
-    ffmpegStatic,
-    "--no-update",
-    "--add-header",
-    `User-Agent:${UA}`,
-  ];
-
-  await new Promise((resolve, reject) => {
-    const yt = new YTDlpWrap(ytDlpBinaryPath).exec(args);
-    let stderr = "";
-    yt.on("ytDlpEvent", () => {}); // keep listener to avoid memory warnings
-    yt.on("error", (err) => reject(err));
-    yt.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`yt-dlp exited with code ${code}. ${stderr}`));
-    });
-    yt.on("stderr", (data) => {
-      stderr += String(data || "");
-    });
-  });
-
-  const size = statBytes(out);
-  if (size <= 0) throw new Error("yt-dlp produced no file");
-  if (size > FETCH_MAX_BYTES) {
-    try { fs.unlinkSync(out); } catch {}
-    throw new Error("Remote file too large");
-  }
-  return {
-    path: out,
-    bytes: size,
-    originalname: "youtube.m4a",
-    mimetype: "audio/mp4",
-  };
-}
-
-// ---------- link helpers, OpenAI, and main processor logic ----------
-function parseUrlSafe(u) {
-  try { return new URL(String(u)); } catch { return null; }
-}
-function hostAllowed(u) {
-  const h = (u.hostname || "").toLowerCase();
-  return ALLOWED_HOSTS.has(h);
-}
-function detectKind(u) {
-  const h = (u.hostname || "").toLowerCase();
-  if (h === "youtu.be" || h.endsWith("youtube.com")) return "youtube";
-  if (h === "drive.google.com") return "gdrive";
-  if (h === "dropbox.com" || h === "www.dropbox.com" || h === "dl.dropboxusercontent.com") return "dropbox";
-  return "unknown";
-}
-function normalizeDrive(urlObj) {
-  const m = urlObj.pathname.match(/\/file\/d\/([^/]+)\//);
-  if (m && m[1]) return `https://drive.google.com/uc?export=download&id=${m[1]}`;
-  if (urlObj.pathname === "/uc") return urlObj.toString();
-  return null;
-}
-function normalizeDropbox(urlObj) {
-  if (urlObj.hostname === "dl.dropboxusercontent.com") return urlObj.toString();
-  urlObj.searchParams.set("dl", "1");
-  return urlObj.toString();
-}
-async function downloadToTemp({ kind, url, requestId }) {
-  const tmpBase = `/tmp/${requestId}`;
-  if (kind === "youtube") return await downloadYouTube(url, tmpBase, requestId);
-  if (kind === "gdrive" || kind === "dropbox") {
-    addStep(requestId, `Fetching from ${kind === "gdrive" ? "Google Drive" : "Dropbox"} …`);
-    const resp = await axios.get(url, {
-      responseType: "stream",
-      maxRedirects: 5,
-      headers: { "User-Agent": UA },
-    });
-    const outPath = `${tmpBase}.input`;
-    let bytes = 0;
-    const ct = String(resp.headers["content-type"] || "");
-    if (kind === "gdrive" && ct.includes("text/html")) {
-      throw new Error("Google Drive says this link is not a direct public download. Make sure sharing is 'Anyone with the link'.");
-    }
-    const cd = String(resp.headers["content-disposition"] || "");
-    let original = "remote";
-    const m = cd.match(/filename\*?=(?:UTF-8''|")?([^"';\r\n]+)/i);
-    if (m && m[1]) original = decodeURIComponent(m[1]).replace(/[^\w.-]+/g, "_").slice(0, 80);
-    await new Promise((resolve, reject) => {
-      const ws = fs.createWriteStream(outPath);
-      resp.data.on("data", (chunk) => {
-        bytes += chunk.length;
-        if (bytes > FETCH_MAX_BYTES) {
-          resp.data.destroy(new Error("Remote file too large"));
-          ws.destroy();
-          reject(new Error("Remote file too large"));
-        }
-      });
-      resp.data.on("error", reject);
-      ws.on("error", reject);
-      ws.on("finish", resolve);
-      resp.data.pipe(ws);
-    });
-    return { path: outPath, bytes, originalname: original, mimetype: ct || "application/octet-stream" };
-  }
-  throw new Error("Unsupported source");
-}
-
+// ---------- OpenAI ----------
 async function openaiTranscribeVerbose(audioPath, requestId) {
   try {
-    addStep(requestId, "Calling Whisper /transcriptions …");
     const fd = new FormData();
     fd.append("file", fs.createReadStream(audioPath), { filename: path.basename(audioPath) });
     fd.append("model", "whisper-1");
@@ -446,16 +258,159 @@ async function openaiTranscribeVerbose(audioPath, requestId) {
     const r = await axios.post("https://api.openai.com/v1/audio/transcriptions", fd, {
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
       maxBodyLength: Infinity,
+      timeout: 300000, // 5 min per part
     });
-    addStep(requestId, "Transcription done.");
     return r.data;
   } catch (err) {
-    console.error(`[${requestId}] Whisper transcribe`, err);
-    throw new Error("Transcription failed");
+    console.error(`[${requestId}] Whisper transcribe error:`, err?.response?.status, err?.message);
+    throw err;
   }
 }
-async function zhTwFromOriginalFaithful(originalText, requestId) {
+
+// ---------- bounded concurrency + retries ----------
+/**
+ * Run an array of async tasks with bounded concurrency.
+ */
+async function runBounded(tasks, limit = 3) {
+  const results = new Array(tasks.length);
+  let next = 0;
+  let active = 0;
+
+  return new Promise((resolve, reject) => {
+    const launchNext = () => {
+      if (next >= tasks.length && active === 0) return resolve(results);
+      while (active < limit && next < tasks.length) {
+        const idx = next++;
+        active++;
+        Promise.resolve()
+          .then(() => tasks[idx]())
+          .then((res) => { results[idx] = res; })
+          .catch(reject)
+          .finally(() => { active--; launchNext(); });
+      }
+    };
+    launchNext();
+  });
+}
+
+/**
+ * Wrapper that retries on 429/5xx with exponential backoff + jitter.
+ */
+async function withRetries(fn, { maxAttempts = 5, baseDelayMs = 500 } = {}) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (e) {
+      attempt++;
+      const status = e?.response?.status;
+      const retriable = status === 429 || (status >= 500 && status < 600);
+      if (!retriable || attempt >= maxAttempts) throw e;
+      const delay = Math.floor(baseDelayMs * Math.pow(2, attempt - 1) + Math.random() * 250);
+      await sleep(delay);
+    }
+  }
+}
+
+// ---------- main processor ----------
+async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }) {
+  await setJobStatus(requestId, "processing");
+  addStep(requestId, `Processing: ${fileMeta.originalname} (${(fileMeta.size / 1024 / 1024).toFixed(2)} MB)`);
+
+  const tempFiles = new Set([inputPath]);
+  const started = Date.now();
+  const model = "whisper-1";
+  let language = "";
+  const fileType = fileMeta.mimetype || "";
+  const fileName = fileMeta.originalname || "upload";
+  const fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size || 0) / (1024 * 1024)) * 100) / 100);
+
   try {
+    // 1) Duration + plan bitrate
+    const durationSec = await ffprobeDurationSeconds(inputPath);
+    addStep(requestId, `Detected duration: ${Math.round(durationSec)}s`);
+
+    const { kbps, needsSplit } = chooseBitrateAndSplit(durationSec);
+    addStep(requestId, `Chosen bitrate: ${kbps} kbps; ${needsSplit ? "will segment" : "single file"}.`);
+
+    let parts = [];
+
+    // 2) Encode (single-pass) either as one file or segmented pattern (single pass)
+    const tmpBase = `/tmp/${requestId}`;
+    if (!needsSplit) {
+      // Encode once → check size → if >25MB, fallback to segmented pass.
+      const singleOut = `${tmpBase}.${kbps}k.mp3`;
+      tempFiles.add(singleOut);
+      await encodeSingleMp3(inputPath, singleOut, kbps, requestId);
+      const sz = statBytes(singleOut);
+      addStep(requestId, `Encoded size: ${(sz / 1024 / 1024).toFixed(2)} MB`);
+      if (sz > OPENAI_AUDIO_MAX) {
+        addStep(requestId, "Single file still >25MB — encoding again with segmentation …");
+        try { fs.unlinkSync(singleOut); } catch {}
+        tempFiles.delete(singleOut);
+        const segSec = computeSegmentSeconds(kbps);
+        const pattern = `${tmpBase}.part-%03d.mp3`;
+        const segs = await encodeAndSegmentMp3(inputPath, pattern, kbps, segSec, requestId);
+        segs.forEach((p) => tempFiles.add(p));
+        parts = segs;
+      } else {
+        parts = [singleOut];
+      }
+    } else {
+      const segSec = computeSegmentSeconds(kbps);
+      const pattern = `${tmpBase}.part-%03d.mp3`;
+      const segs = await encodeAndSegmentMp3(inputPath, pattern, kbps, segSec, requestId);
+      segs.forEach((p) => tempFiles.add(p));
+      parts = segs;
+    }
+
+    // 3) Duration for DB & billing
+    // Use encoded parts to compute actual seconds (accurate after re-encode)
+    async function getSeconds(filePath) {
+      return new Promise((resolve, reject) => {
+        ffmpeg.ffprobe(filePath, (err, meta) => {
+          if (err) return reject(err);
+          resolve(Number(meta?.format?.duration) || 0);
+        });
+      });
+    }
+    let jobSeconds = 0;
+    for (const p of parts) jobSeconds += await getSeconds(p);
+    jobSeconds = Math.round(jobSeconds);
+    const minutesForDb = secsToSheetMinutes(jobSeconds);
+    const [rows] = await db.query(
+      "SELECT SUM(jobSeconds) as totalSeconds FROM transcriptions WHERE email = ? AND succeeded = 1",
+      [email]
+    );
+    const pastSeconds = Number(rows?.[0]?.totalSeconds || 0);
+    const cumulativeSeconds = pastSeconds + jobSeconds;
+    const cumulativeMinutesForDb = secsToSheetMinutes(cumulativeSeconds);
+    addStep(requestId, `Duration this job: ${jobSeconds}s; cumulative: ${cumulativeSeconds}s.`);
+
+    // 4) Parallel (bounded) transcription with retries
+    addStep(requestId, `Transcribing ${parts.length} part(s) in parallel (bounded)…`);
+    const concurrency = Number(process.env.WHISPER_CONCURRENCY || 3);
+
+    const tasks = parts.map((filePath, idx) => async () => {
+      addStep(requestId, `Part ${idx + 1}/${parts.length} → start`);
+      const res = await withRetries(() => openaiTranscribeVerbose(filePath, requestId), {
+        maxAttempts: 5,
+        baseDelayMs: 700,
+      });
+      addStep(requestId, `Part ${idx + 1}/${parts.length} → done`);
+      return res;
+    });
+
+    const results = await runBounded(tasks, concurrency);
+
+    // 5) Concatenate in order; capture language from first non-empty
+    let originalAll = "";
+    for (const verbose of results) {
+      if (!language && verbose?.language) language = verbose.language;
+      originalAll += (originalAll ? "\n\n" : "") + (verbose?.text || "");
+    }
+
+    // 6) zh-TW faithful translation
     addStep(requestId, "Calling GPT 原文→繁中 (faithful) …");
     const systemPrompt = `你是國際會議的專業口筆譯員。請把使用者提供的「原文」完整翻譯成「繁體中文（台灣慣用）」並嚴格遵守：
 1) 忠實轉譯：不可增刪、不可臆測，不加入任何評論；僅做必要語法與詞序調整以使中文通順。
@@ -464,59 +419,20 @@ async function zhTwFromOriginalFaithful(originalText, requestId) {
 4) 標點使用中文全形標點。只輸出中文譯文，不要任何說明。`;
     const r = await axios.post(
       "https://api.openai.com/v1/chat/completions",
-      { model: "gpt-4o-mini", temperature: 0, messages: [{ role: "system", content: systemPrompt }, { role: "user", content: originalText || "" }] },
+      {
+        model: "gpt-4o-mini",
+        temperature: 0,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: originalAll || "" },
+        ],
+      },
       { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
     );
+    const zhTraditional = r.data?.choices?.[0]?.message?.content?.trim() || "";
     addStep(requestId, "繁中 done.");
-    return r.data?.choices?.[0]?.message?.content?.trim() || "";
-  } catch (err) {
-    console.error(`[${requestId}] GPT 原文→繁中`, err);
-    throw new Error("Traditional Chinese translation failed");
-  }
-}
 
-async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }) {
-  await setJobStatus(requestId, "processing");
-  addStep(requestId, `Processing: ${fileMeta.originalname} (${(fileMeta.size / 1024 / 1024).toFixed(2)} MB)`);
-  const tempFiles = [inputPath];
-  const started = Date.now();
-  const model = "whisper-1";
-  let language = "";
-  const fileType = fileMeta.mimetype || "";
-  const fileName = fileMeta.originalname || "upload";
-  const fileSizeMB = Math.max(0.01, Math.round(((fileMeta.size || 0) / (1024 * 1024)) * 100) / 100);
-  try {
-    let prepared, parts = [];
-    try {
-      prepared = await prepareMp3UnderLimit(inputPath, requestId);
-      tempFiles.push(prepared.path);
-      parts = await splitIfNeeded(prepared.path, requestId);
-      if (parts.length > 1) {
-        tempFiles.push(...parts);
-        tempFiles.push(prepared.path + ".clean.wav");
-      }
-    } catch (e) {
-      addStep(requestId, "❌ Transcode failed: " + (e?.message || e));
-      throw e;
-    }
-    const filesForDuration = parts && parts.length ? parts : [prepared?.path || inputPath];
-    const jobSeconds = await sumSeconds(filesForDuration);
-    const minutesForDb = secsToSheetMinutes(jobSeconds);
-    const pastSeconds = await getPastSecondsForEmail(email);
-    const cumulativeSeconds = pastSeconds + jobSeconds;
-    const cumulativeMinutesForDb = secsToSheetMinutes(cumulativeSeconds);
-    addStep(requestId, `Duration this job: ${jobSeconds}s; cumulative: ${cumulativeSeconds}s.`);
-
-    let originalAll = "";
-    const filesForTranscription = parts && parts.length ? parts : [prepared?.path || inputPath];
-    for (let i = 0; i < filesForTranscription.length; i++) {
-      if (filesForTranscription.length > 1) addStep(requestId, `Part ${i + 1}/${filesForTranscription.length} …`);
-      const verbose = await openaiTranscribeVerbose(filesForTranscription[i], requestId);
-      if (!language) language = verbose.language || "";
-      originalAll += (originalAll ? "\n\n" : "") + (verbose.text || "");
-    }
-
-    const zhTraditional = await zhTwFromOriginalFaithful(originalAll, requestId);
+    // 7) Build attachments + email
     const localStamp = fmtLocalStamp(new Date());
     const attachmentText = `＝＝ 中文（繁體） ＝＝\n${zhTraditional}\n\n＝＝ 原文 ＝＝\n${originalAll}\n`;
     const safeBase = (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
@@ -546,11 +462,16 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       text: `轉寫已完成 ${localStamp}\n\n本次上傳時長（秒）：${jobSeconds}\n\n（服務單號：${requestId}）`,
       attachments: [
         { filename: txtName, content: attachmentText, contentType: "text/plain; charset=utf-8" },
-        { filename: docxName, content: docxBuffer, contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
+        {
+          filename: docxName,
+          content: docxBuffer,
+          contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        },
       ],
     });
     addStep(requestId, "Email sent.");
 
+    // 8) DB record
     try {
       const sql =
         `INSERT INTO transcriptions ( timestampUTC, timestampLocal, email, jobSeconds, cumulativeSeconds, minutes, cumulativeMinutes, fileName, fileSizeMB, language, requestId, processingMs, succeeded, errorMessage, model, fileType )
@@ -567,6 +488,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       addStep(requestId, "⚠️ Database insert failed: " + (e?.message || e));
     }
 
+    // 9) notify + done
     await consume({
       event: "transcription.finished",
       status: "succeeded",
@@ -602,25 +524,37 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     });
   } finally {
     addStep(requestId, "Cleaning up temporary files...");
-    for (const f of fs.readdirSync("/tmp")) {
-      if (f.startsWith(requestId)) {
-        try { fs.unlinkSync(path.join("/tmp", f)); } catch {}
-      }
+    for (const f of Array.from(tempFiles)) {
+      try { if (f && fs.existsSync(f)) fs.unlinkSync(f); } catch {}
     }
   }
 }
 
 // ---------- routes ----------
-app.post("/upload", upload.single("file"), async (req, res) => {
+app.post("/upload", (req, res, next) => {
+  upload.single("file")(req, res, function (err) {
+    if (err && err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({
+        error: `File too large. Max ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB.`,
+      });
+    }
+    if (err) {
+      return res.status(400).json({ error: err.message || "Upload error" });
+    }
+    next();
+  });
+}, async (req, res) => {
   try {
     const email = (req.body.email || "").trim();
     const jobId = (req.body.job_id || "").toString();
     const token = (req.body.token || "").toString();
     if (!email) return res.status(400).json({ error: "Email is required" });
     if (!req.file) return res.status(400).json({ error: "File is required" });
+
     const requestId = crypto.randomUUID();
     await createJob(requestId);
     res.status(202).json({ success: true, accepted: true, requestId });
+
     setImmediate(() =>
       processJob({
         email,
@@ -640,77 +574,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-app.post("/fetch", async (req, res) => {
-  try {
-    const email = String(req.body.email || "").trim();
-    const urlRaw = String(req.body.url || "").trim();
-    const jobId = (req.body.job_id || "").toString();
-    const token = (req.body.token || "").toString();
-    if (!email) return res.status(400).json({ error: "Email is required" });
-    if (!urlRaw) return res.status(400).json({ error: "URL is required" });
-
-    const u = parseUrlSafe(urlRaw);
-    if (!u) return res.status(400).json({ error: "Bad URL" });
-    if (!hostAllowed(u))
-      return res.status(400).json({ error: "Only YouTube, Google Drive (public), or Dropbox (public) are allowed." });
-
-    let kind = detectKind(u);
-    let normalized = urlRaw;
-    if (kind === "gdrive") {
-      const n = normalizeDrive(u);
-      if (!n) return res.status(400).json({ error: "Unsupported Google Drive link format." });
-      normalized = n;
-    }
-    if (kind === "dropbox") {
-      normalized = normalizeDropbox(u);
-    }
-
-    const requestId = crypto.randomUUID();
-    await createJob(requestId);
-    res.status(202).json({ success: true, accepted: true, requestId });
-
-    setImmediate(async () => {
-      try {
-        const fetched = await downloadToTemp({ kind, url: normalized, requestId });
-        const meta = {
-          originalname: fetched.originalname || "remote",
-          mimetype: fetched.mimetype || "application/octet-stream",
-          size: fetched.bytes || statBytes(fetched.path),
-        };
-        await processJob({
-          email,
-          inputPath: fetched.path,
-          fileMeta: meta,
-          requestId,
-          jobId,
-          token,
-        });
-      } catch (e) {
-        const msg = e?.message || "Remote fetch failed";
-        addStep(requestId, "❌ " + msg);
-        setJobStatus(requestId, "error", msg);
-        await consume({
-          event: "transcription.finished",
-          status: "failed",
-          email,
-          filename: "remote",
-          request_id: requestId,
-          job_id: jobId || "",
-          token: token || "",
-          duration_sec: 0,
-          charged_seconds: 0,
-          language: "",
-          finished_at: new Date().toISOString(),
-          error: msg,
-        });
-      }
-    });
-  } catch (err) {
-    console.error("❌ fetch error:", err?.message || err);
-    res.status(500).json({ error: "Fetch failed at accept stage" });
-  }
-});
-
-app.get("/", (_req, res) => res.send("✅ Whisper backend running"));
+app.get("/", (_req, res) => res.send("✅ Whisper backend (upload-only, optimized) running"));
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
