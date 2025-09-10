@@ -97,7 +97,7 @@ async function storeTranscript(requestId, txtContent, docxBuffer) {
 
 // ---------- app / setup ----------
 const app = express();
-const allowedOrigins = ["https://voixl.com", "https://www.voixl.com"];
+const allowedOrigins = ["https://voixl.com", "https://www.voixl.com", "https://dottlight.com", "https://www.dottlight.com"];
 app.use(
   cors({
     origin: function (origin, callback) {
