@@ -641,7 +641,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
           WHERE email = $1 AND succeeded = true`,
         [email]
       );
-      pastSeconds = Number(rows?.[0]?.total || 0);
+    pastSeconds = Number(rows?.[0]?.total || 0);
     } catch (e) {
       console.error("⚠️ getPastSeconds query error:", e.message || e);
     }
@@ -886,6 +886,57 @@ app.post(
     });
   }
 );
+
+// === DB TRIM/PURGE START ===
+// Minimal, opt-in admin endpoint to reduce DB usage.
+// Uses WORKER_SHARED_KEY for authorization.
+// Env overrides:
+//   TRIM_JOBS_EMPTY_DAYS (default 7)
+//   PURGE_JOBS_DAYS      (default 30)
+const TRIM_JOBS_EMPTY_DAYS = Number(process.env.TRIM_JOBS_EMPTY_DAYS || 7);
+const PURGE_JOBS_DAYS = Number(process.env.PURGE_JOBS_DAYS || 30);
+
+app.post("/admin/trim-jobs", async (req, res) => {
+  try {
+    const key = req.get("X-Worker-Key") || "";
+    if (!WORKER_SHARED_KEY || key !== WORKER_SHARED_KEY) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const r1 = await pool.query(
+      `
+      UPDATE jobs
+         SET steps = '[]'::jsonb
+       WHERE status IN ('done','error')
+         AND created_at < now() - ($1 || ' days')::interval
+      `,
+      [String(TRIM_JOBS_EMPTY_DAYS)]
+    );
+
+    const r2 = await pool.query(
+      `
+      DELETE FROM jobs
+       WHERE created_at < now() - ($1 || ' days')::interval
+      `,
+      [String(PURGE_JOBS_DAYS)]
+    );
+
+    // Optional: lightweight analyze to keep planner stats fresh
+    await pool.query(`ANALYZE jobs;`);
+
+    return res.json({
+      ok: true,
+      trimmed_steps_rows: r1.rowCount || 0,
+      purged_job_rows: r2.rowCount || 0,
+      trim_days: TRIM_JOBS_EMPTY_DAYS,
+      purge_days: PURGE_JOBS_DAYS,
+    });
+  } catch (err) {
+    console.error("/admin/trim-jobs error:", err?.message || err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+// === DB TRIM/PURGE END ===
 
 app.get("/", (_req, res) =>
   res.send("✅ Whisper backend (upload-only, Postgres) running")
