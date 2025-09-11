@@ -893,8 +893,8 @@ app.post(
 // Env overrides:
 //   TRIM_JOBS_EMPTY_DAYS (default 7)
 //   PURGE_JOBS_DAYS      (default 30)
-const TRIM_JOBS_EMPTY_DAYS = Number(process.env.TRIM_JOBS_EMPTY_DAYS || 7);
-const PURGE_JOBS_DAYS = Number(process.env.PURGE_JOBS_DAYS || 30);
+const TRIM_JOBS_EMPTY_DAYS = Number(process.env.TRIM_JOBS_EMPTY_DAYS || 1);
+const PURGE_JOBS_DAYS = Number(process.env.PURGE_JOBS_DAYS || 1);
 
 app.post("/admin/trim-jobs", async (req, res) => {
   try {
