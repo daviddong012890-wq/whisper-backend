@@ -299,7 +299,7 @@ const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 const axiosOpenAI = axios.create({
   httpAgent,
   httpsAgent,
-  timeout: 600000, // <<< FIX: no hard timeout (or set to 600000 for 10 minutes)
+  timeout: 900000, // <<< FIX: no hard timeout (or set to 600000 for 10 minutes)
   maxContentLength: Infinity,
   maxBodyLength: Infinity,
   headers: {
