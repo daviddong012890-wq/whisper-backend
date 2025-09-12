@@ -112,6 +112,19 @@ app.use(
 app.options("*", cors());
 app.use(express.json({ limit: "1mb" }));
 
+// <<< FIX: keep long uploads alive (disable per-request timeouts)
+app.use((req, _res, next) => {
+  // no overall inactivity timeout for this request
+  try { req.setTimeout?.(0); } catch {}
+  try {
+    if (req.socket) {
+      req.socket.setTimeout?.(0);
+      req.socket.setKeepAlive?.(true, 60_000);
+    }
+  } catch {}
+  next();
+});
+
 // ===== Upload-only mode =====
 const MAX_UPLOAD_BYTES = Number(
   process.env.MAX_UPLOAD_BYTES || 1.5 * 1024 * 1024 * 1024
@@ -286,7 +299,7 @@ const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 const axiosOpenAI = axios.create({
   httpAgent,
   httpsAgent,
-  timeout: 120000, // 120s hard timeout
+  timeout: 0, // <<< FIX: no hard timeout (or set to 600000 for 10 minutes)
   maxContentLength: Infinity,
   maxBodyLength: Infinity,
   headers: {
@@ -484,8 +497,13 @@ async function withRetries(fn, { maxAttempts = 5, baseDelayMs = 700 } = {}) {
     } catch (e) {
       attempt++;
       const s = e?.response?.status;
+      const code = e?.code || "";
       const retriable =
-        s === 429 || (s >= 500 && s < 600) || e.code === "ECONNRESET" || e.code === "ETIMEDOUT";
+        s === 429 ||
+        (s >= 500 && s < 600) ||
+        code === "ECONNRESET" ||
+        code === "ETIMEDOUT" ||
+        code === "ECONNABORTED"; // <<< FIX: Axios timeout code
       if (!retriable || attempt >= maxAttempts) throw e;
       const delay = Math.floor(baseDelayMs * Math.pow(2, attempt - 1) + Math.random() * 250);
       await sleepMs(delay);
@@ -513,22 +531,17 @@ async function runBounded(tasks, limit = 3) {
 }
 
 // ---------- GPT translation (multilingual → zh-TW, robust) ----------
-// UNCHANGED SystemPrompt (your original):
 async function gptTranslateFaithful(originalAll, requestId) {
   const systemPrompt = `你是國際會議的一線口筆譯員。請把使用者提供的「原文」完整翻譯成「繁體中文（台灣慣用）」並嚴格遵守：
 
 1) 忠實轉譯：不得增刪、不得臆測，不加入任何評論；僅做必要語序與語法調整，使中文可讀但不意譯。
 2) 句序與段落：依原文的順序與分段輸出；保留重複、口頭語與語氣詞（如「嗯」「呃」），除非影響理解才可輕微平順化。
-3) 多語切換：不論原文出現哪些語言（如英文、西文、法文、德文、中文等），一律譯為繁體中文。
-   - 專有名詞與常見譯名：使用台灣慣用或通行的中文譯名。
-   - 若無固定譯名：採音譯或意譯，並在「首次出現」於中文後加上原文括號，例如：桑德拉（Sandra）、哥倫比亞大學（Columbia University）。
-4) 數字與單位：數字使用阿拉伯數字；度量衡、貨幣等採台灣常用寫法（公里、公斤、美元…）。
+3) 多語切換：一律譯為繁體中文（台灣慣用）。
+4) 數字與單位：採台灣常用寫法。
 5) 標點：使用中文全形標點。
-6) 保留不應翻的內容：網址、電子郵件、檔名、程式碼片段、指令、模型名稱等以原樣保留（可配合中文標點）。
-7) 只輸出譯文正文：不要任何說明、標題或註解；不要摘要或重寫。
-8) 若原文本身是中文：統一為台灣慣用詞與全形標點，避免過度改寫。
-
-請直接輸出最終譯文。`;
+6) 保留網址/檔名/程式碼等原樣。
+7) 只輸出譯文正文。
+8) 原文若已是中文：統一台灣慣用詞與全形標點。`;
 
   const payload = {
     model: "gpt-4o-mini",
@@ -641,7 +654,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
           WHERE email = $1 AND succeeded = true`,
         [email]
       );
-    pastSeconds = Number(rows?.[0]?.total || 0);
+      pastSeconds = Number(rows?.[0]?.total || 0);
     } catch (e) {
       console.error("⚠️ getPastSeconds query error:", e.message || e);
     }
@@ -669,7 +682,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       originalAll += (originalAll ? "\n\n" : "") + (verbose?.text || "");
     }
 
-    // zh-TW faithful translation (UNCHANGED prompt)
+    // zh-TW faithful translation
     addStep(requestId, "Calling GPT 原文→繁中 (faithful, multilingual) …");
     let zhTraditional = "";
     try {
@@ -740,7 +753,7 @@ ${originalAll}
     });
     addStep(requestId, "Email sent.");
 
-    // ✅ also save TXT/DOCX to your PHP storage so dashboard buttons work
+    // save to PHP so dashboard download buttons work
     await storeTranscript(requestId, attachmentText, docxBuffer);
 
     // insert transcriptions row
@@ -853,7 +866,7 @@ app.post(
     if (!req.file) return res.status(400).json({ error: "File is required" });
 
     const requestId =
-  (req.body?.request_id || "").toString().trim() || crypto.randomUUID();
+      (req.body?.request_id || "").toString().trim() || crypto.randomUUID();
 
     // Respond first so frontend doesn't see DB blips
     res.status(202).json({ success: true, accepted: true, requestId });
@@ -888,11 +901,6 @@ app.post(
 );
 
 // === DB TRIM/PURGE START ===
-// Minimal, opt-in admin endpoint to reduce DB usage.
-// Uses WORKER_SHARED_KEY for authorization.
-// Env overrides:
-//   TRIM_JOBS_EMPTY_DAYS (default 7)
-//   PURGE_JOBS_DAYS      (default 30)
 const TRIM_JOBS_EMPTY_DAYS = Number(process.env.TRIM_JOBS_EMPTY_DAYS || 1);
 const PURGE_JOBS_DAYS = Number(process.env.PURGE_JOBS_DAYS || 1);
 
@@ -921,7 +929,6 @@ app.post("/admin/trim-jobs", async (req, res) => {
       [String(PURGE_JOBS_DAYS)]
     );
 
-    // Optional: lightweight analyze to keep planner stats fresh
     await pool.query(`ANALYZE jobs;`);
 
     return res.json({
@@ -941,5 +948,10 @@ app.post("/admin/trim-jobs", async (req, res) => {
 app.get("/", (_req, res) =>
   res.send("✅ Whisper backend (upload-only, Postgres) running")
 );
+
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
+// <<< FIX: capture server and relax default Node timeouts
+const server = app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
+server.requestTimeout = 0;       // no overall per-request timeout
+server.headersTimeout = 0;       // allow slow clients to send headers
+server.keepAliveTimeout = 60_000;
