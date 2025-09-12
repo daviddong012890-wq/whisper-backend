@@ -148,7 +148,7 @@ const GMAIL_USER = process.env.GMAIL_USER;
 const GMAIL_PASS = process.env.GMAIL_PASS;
 const LOCAL_TZ = process.env.LOCAL_TZ || "America/Los_Angeles";
 const FROM_EMAIL = process.env.FROM_EMAIL || GMAIL_USER;
-const FROM_NAME = process.env.FROM_NAME || "逐字稿產生器";
+const FROM_NAME = process.env.FROM_NAME || "VOIXL.com";
 
 function fatal(m) {
   console.error("❌ " + m);
