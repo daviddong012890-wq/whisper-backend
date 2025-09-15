@@ -403,7 +403,7 @@ async function encodeSingleMp3(inPath, outMp3, kbps, requestId) {
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
-      .audioFilters(["highpass=f=200", "lowpass=f=3800", "dynaudnorm"])
+      .audioFilters(["dynaudnorm"])
       .outputOptions([
         "-ac",
         "1",
@@ -425,7 +425,7 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
-      .audioFilters(["highpass=f=200", "lowpass=f=3800", "dynaudnorm"])
+      .audioFilters(["dynaudnorm"])
       .outputOptions([
         "-ac",
         "1",
@@ -466,6 +466,11 @@ async function openaiTranscribeVerbose(audioPath, requestId) {
     fd.append("model", "whisper-1");
     fd.append("response_format", "verbose_json");
     fd.append("temperature", "0");
+    // Transcription-only instructions to improve detection & keep dialects verbatim
+    fd.append(
+      "prompt",
+      "For the transcription stage only: auto-detect the spoken language and transcribe verbatim in that same language. Do not translate, paraphrase, summarize, or normalize to another language (e.g., do not convert dialects into Standard Mandarin). Preserve dialect words, accent forms, code-mixed words, proper names, numbers, and punctuation exactly as spoken. Output only the transcript in the original language."
+    );
     const r = await axiosOpenAI.post(
       "https://api.openai.com/v1/audio/transcriptions",
       fd,
@@ -541,7 +546,11 @@ async function gptTranslateFaithful(originalAll, requestId) {
 5) 標點：使用中文全形標點。
 6) 保留網址/檔名/程式碼等原樣。
 7) 只輸出譯文正文。
-8) 原文若已是中文：統一台灣慣用詞與全形標點。`;
+8) 原文若已是中文：統一台灣慣用詞與全形標點。
+9) 雙語與夾雜：原文可能同一句中同時包含多種語言（例如「我今天有一個很開心的一天，但是我的 cousin 跟我的 friend 他們給了我一個很大的 surprise 因為今天是我的 birthday」）。除人名、地名、品牌名、網址、檔名與程式碼外，所有外語詞彙一律譯為繁體中文，避免保留英文或拼音。對難以確定的親屬稱謂等，使用不臆測的中性繁中表達（例如「表／堂親」、「朋友」、「生日」）。
+10) 中文方言：若原文為中文方言或口語（含吳語、粵語等），不得改寫其語義；僅規整為繁體中文用字與全形標點。
+11) 專有名詞：人名、地名、品牌名可用通行中文譯名；若無通行譯名可保留原語，但仍須使用全形標點並與中文語句自然整合。
+12) 不得意譯：除為可讀性所需的最小語序調整外，嚴禁意譯或自創資訊。`;
 
   const payload = {
     model: "gpt-4o-mini",
@@ -681,6 +690,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       if (!language && verbose?.language) language = verbose.language;
       originalAll += (originalAll ? "\n\n" : "") + (verbose?.text || "");
     }
+    addStep(requestId, `Detected language: ${language || "unknown"}`);
 
     // zh-TW faithful translation
     addStep(requestId, "Calling GPT 原文→繁中 (faithful, multilingual) …");
@@ -822,7 +832,7 @@ ${originalAll}
       filename: fileName,
       request_id: requestId,
       job_id: jobId || "",
-      token: token || "",
+      token: String(token || ""),
       duration_sec: 0,
       charged_seconds: 0,
       language: "",
