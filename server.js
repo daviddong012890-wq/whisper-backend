@@ -544,7 +544,7 @@ async function gptTranslateFaithful(originalAll, requestId) {
 
 **輸出格式（嚴格遵守）：**
 - 第1行（固定文字）：**免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。請務必自行複核與修訂。因翻譯或轉寫錯誤所致之任何損失或責任，本服務概不負擔。**
-- 第2行（固定文字）：\`＝＝ 中文（繁體） ＝＝\`
+- 第2行（固定文字）：\`以下是您的中文逐字稿：\`
 - 第3行：空行
 - 第4行起：**只輸出中文譯文正文**（段落化）。不得輸出標題、說明、步驟、道歉語，亦不得回顯原文或 \`<source>\`。
 
@@ -560,8 +560,8 @@ async function gptTranslateFaithful(originalAll, requestId) {
       model: preferred,
       temperature: 0,
       input: [
-        { role: "system", content: [{ type: "text", text: systemPrompt }] },
-        { role: "user",   content: [{ type: "text", text: originalAll || "" }] },
+        { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+        { role: "user",   content: [{ type: "input_text", text: originalAll || "" }] },
       ],
       // If using reasoning models, you can optionally nudge effort:
       // reasoning: { effort: "medium" },
