@@ -13,6 +13,7 @@ import http from "http";
 import https from "https";
 import { Pool } from "pg";
 import { Document, Packer, Paragraph } from "docx";
+import OpenAI from "openai"; // ← NEW
 
 // ---------- notify PHP (worker-consume.php) ----------
 const CONSUME_URL = process.env.CONSUME_URL || "";
@@ -521,7 +522,10 @@ async function runBounded(tasks, limit = 3) {
   });
 }
 
-// ---------- GPT translation (multilingual → zh-TW, robust) ----------
+// ---------- OpenAI SDK client (for Responses API) ----------
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); // ← NEW
+
+// ---------- GPT translation (Responses API + fallbacks) ----------
 async function gptTranslateFaithful(originalAll, requestId) {
   const systemPrompt = `你是國際會議的一線口筆譯員。請把使用者提供的「原文」完整翻譯成「繁體中文（台灣慣用）」並嚴格遵守：
 
@@ -538,31 +542,77 @@ async function gptTranslateFaithful(originalAll, requestId) {
 11) 專有名詞：人名、地名、品牌名可用通行中文譯名；若無通行譯名可保留原語，但仍須使用全形標點並與中文語句自然整合。
 12) 不得意譯：除為可讀性所需的最小語序調整外，嚴禁意譯或自創資訊。`;
 
-  const payload = {
-    model: "gpt-4o-mini",
-    temperature: 0,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: originalAll || "" },
-    ],
-  };
+  const preferred = process.env.TRANSLATION_MODEL || "gpt-4o-mini";
 
-  const resp = await withRetries(
-    () =>
-      axiosOpenAI.post("https://api.openai.com/v1/chat/completions", payload, {
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-        // Only treat 2xx as success so 4xx/5xx trigger retries/catch
-        validateStatus: (s) => s >= 200 && s < 300,
-      }),
-    { maxAttempts: 5, baseDelayMs: 800 }
-  );
+  // Try Responses API first (works with reasoning/thinking models if enabled)
+  try {
+    const resp = await openai.responses.create({
+      model: preferred,
+      temperature: 0,
+      input: [
+        { role: "system", content: [{ type: "text", text: systemPrompt }] },
+        { role: "user",   content: [{ type: "text", text: originalAll || "" }] },
+      ],
+      // If using reasoning models, you can optionally nudge effort:
+      // reasoning: { effort: "medium" },
+      // response_format: { type: "text" },
+    });
 
-  const out = resp?.data?.choices?.[0]?.message?.content?.trim();
-  if (!out) {
-    // Never silently return empty translations
-    throw new Error("Empty translation from model");
+    const out =
+      (resp.output_text && resp.output_text.trim()) ||
+      (Array.isArray(resp.output)
+        ? resp.output
+            .flatMap(o => (o?.content || []))
+            .map(c => (typeof c?.text === "string" ? c.text : ""))
+            .join("")
+            .trim()
+        : "");
+
+    if (out) return out;
+
+    await addStep(requestId, `Responses output empty from ${preferred}; falling back.`);
+  } catch (e) {
+    const msg = e?.response?.data?.error?.message || e?.message || String(e);
+    await addStep(requestId, `Responses API failed (${preferred}): ${msg}; falling back.`);
   }
-  return out;
+
+  // Fallback to Chat Completions (stable, widely available)
+  const chatCandidates = ["gpt-4o", "gpt-4o-mini"];
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: originalAll || "" },
+  ];
+
+  for (const model of chatCandidates) {
+    try {
+      const r = await axiosOpenAI.post(
+        "https://api.openai.com/v1/chat/completions",
+        { model, temperature: 0, messages, response_format: { type: "text" } },
+        {
+          headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+          validateStatus: () => true,
+        }
+      );
+      if (r.status >= 200 && r.status < 300) {
+        const out = r.data?.choices?.[0]?.message?.content?.trim();
+        if (out) {
+          if (model !== preferred) await addStep(requestId, `Used fallback chat model: ${model}`);
+          return out;
+        }
+        await addStep(requestId, `Chat output empty from ${model}; trying next.`);
+      } else {
+        await addStep(
+          requestId,
+          `Chat API error (${model}): ${r.data?.error?.message || `HTTP ${r.status}`}`
+        );
+      }
+    } catch (e) {
+      await addStep(requestId, `Chat API exception (${model}): ${e?.message || e}`);
+    }
+  }
+
+  // Last resort: never return blank
+  return "【翻譯暫不可用：已附上原文】\n\n" + (originalAll || "");
 }
 
 // ---------- main processor ----------
