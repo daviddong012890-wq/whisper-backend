@@ -379,7 +379,7 @@ function ffprobeDurationSeconds(filePath) {
 function estimateSizeBytes(seconds, kbps) {
   return Math.ceil(seconds * (kbps * 1000) / 8);
 }
-function chooseBitrateAndSplit(seconds, candidateKbps = [96, 80, 64]) { // <<< UPDATED LADDER
+function chooseBitrateAndSplit(seconds, candidateKbps = [96, 64, 48, 32, 24, 16]) {
   for (const kb of candidateKbps) {
     const est = estimateSizeBytes(seconds, kb);
     if (est <= TARGET_MAX_BYTES) {
@@ -397,50 +397,61 @@ function computeSegmentSeconds(kbps) {
   return Math.max(MIN_SEG_SECONDS, Math.min(MAX_SEG_SECONDS, seconds || DEFAULT_SEG_SECONDS));
 }
 
-// ---------- single-pass encode helpers ----------
-async function encodeSingleMp3(inPath, outMp3, kbps, requestId) {
-  addStep(requestId, `Encode MP3 @ ${kbps} kbps (single file)…`);
+// ---------- NEW: try lossless audio extract (copy) ----------
+async function tryExtractAudio(inPath, outM4a, requestId) {
+  addStep(requestId, "Attempting lossless audio extract (no re-encode) …");
+  return new Promise((resolve) => {
+    ffmpeg(inPath)
+      .noVideo()
+      .outputOptions([
+        "-vn",
+        "-c:a", "copy",
+        "-movflags", "faststart"
+      ])
+      .save(outM4a)
+      .on("end", () => resolve(true))
+      .on("error", () => resolve(false)); // silently fall back
+  });
+}
+
+// ---------- single-pass encode helpers (switch to AAC/M4A, 64 kbps, 32 kHz) ----------
+async function encodeSingleMp3(inPath, outM4a, kbps, requestId) {
+  // (Function name kept for compatibility with your code paths)
+  addStep(requestId, `Encode AAC/M4A @ ${kbps} kbps, mono, 32 kHz (single file)…`);
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
       .audioFilters(["dynaudnorm"])
       .outputOptions([
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-b:a",
-        `${kbps}k`,
-        "-codec:a",
-        "libmp3lame",
+        "-ac", "1",
+        "-ar", "32000",
+        "-b:a", `${kbps}k`,
+        "-c:a", "aac",
+        "-movflags", "faststart"
       ])
-      .save(outMp3)
+      .save(outM4a)
       .on("end", resolve)
       .on("error", reject);
   });
-  return outMp3;
+  return outM4a;
 }
+
 async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, requestId) {
-  addStep(requestId, `Encode+Segment MP3 @ ${kbps} kbps, ~${segmentSeconds}s/part…`);
+  // (Function name kept for compatibility with your code paths)
+  addStep(requestId, `Encode+Segment AAC/M4A @ ${kbps} kbps, mono, 32 kHz, ~${segmentSeconds}s/part…`);
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
       .audioFilters(["dynaudnorm"])
       .outputOptions([
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-b:a",
-        `${kbps}k`,
-        "-codec:a",
-        "libmp3lame",
-        "-f",
-        "segment",
-        "-segment_time",
-        String(segmentSeconds),
-        "-reset_timestamps",
-        "1",
+        "-ac", "1",
+        "-ar", "32000",
+        "-b:a", `${kbps}k`,
+        "-c:a", "aac",
+        "-movflags", "faststart",
+        "-f", "segment",
+        "-segment_time", String(segmentSeconds),
+        "-reset_timestamps", "1"
       ])
       .save(outPattern)
       .on("end", resolve)
@@ -450,7 +461,7 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
   const base = path.basename(outPattern).split("%")[0];
   const files = fs
     .readdirSync(dir)
-    .filter((n) => n.startsWith(base) && n.endsWith(".mp3"))
+    .filter((n) => n.startsWith(base) && n.endsWith(".m4a"))
     .map((n) => path.join(dir, n))
     .sort();
   return files;
@@ -583,43 +594,6 @@ async function gptTranslateFaithful(originalAll, requestId) {
   return resp?.data?.choices?.[0]?.message?.content?.trim() || "";
 }
 
-// ---------- minimal repeat-collapser (fix Whisper loop artifacts) ----------
-function collapseRepeatedSentences(input, requestId) {
-  if (!input) return input;
-  // Split by sentence-like boundaries (handles CJK & Latin) while keeping punctuation in place.
-  const parts = input
-    .split(/(?<=[。！？!?]|(?:\.\s)|(?:\?\s)|(?:!\s)|\n)/g)
-    .map(s => s.replace(/\s+$/g, "")); // trim right to normalize
-  const out = [];
-  let lastKey = "";
-  let repeatCount = 0;
-
-  for (const raw of parts) {
-    const s = raw; // preserve original spacing/punct except trailing spaces
-    const key = s.replace(/\s+/g, " ").trim(); // normalized for comparison
-    if (!key) continue;
-
-    if (key === lastKey) {
-      repeatCount++;
-      // allow one repeat at most; drop further exact consecutive dups
-      if (repeatCount >= 1) {
-        continue;
-      }
-    } else {
-      lastKey = key;
-      repeatCount = 0;
-    }
-    out.push(s);
-  }
-
-  const result = out.join("").replace(/\n{3,}/g, "\n\n");
-  // Optional log if we actually collapsed a lot
-  if (result.length + 50 < input.length) {
-    addStep(requestId, `Collapsed repeated fragments (${input.length}→${result.length} chars).`);
-  }
-  return result;
-}
-
 // ---------- main processor ----------
 async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }) {
   await setJobStatus(requestId, "processing");
@@ -642,38 +616,62 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     const durationSec = await ffprobeDurationSeconds(inputPath);
     addStep(requestId, `Detected duration: ${Math.round(durationSec)}s`);
 
-    const { kbps, needsSplit } = chooseBitrateAndSplit(durationSec);
-    addStep(
-      requestId,
-      `Chosen bitrate: ${kbps} kbps; ${needsSplit ? "will segment" : "single file"}.`
-    );
-
+    // PLAN: try lossless extract first; if too big, encode to AAC/M4A @64kbps; segment if needed.
     let parts = [];
     const tmpBase = `/tmp/${requestId}`;
-    if (!needsSplit) {
-      const singleOut = `${tmpBase}.${kbps}k.mp3`;
-      tempFiles.add(singleOut);
-      await encodeSingleMp3(inputPath, singleOut, kbps, requestId);
-      const sz = statBytes(singleOut);
-      addStep(requestId, `Encoded size: ${(sz / 1024 / 1024).toFixed(2)} MB`);
-      if (sz > OPENAI_AUDIO_MAX) {
-        addStep(requestId, "Single file still >25MB — encoding again with segmentation …");
-        try { fs.unlinkSync(singleOut); } catch {}
-        tempFiles.delete(singleOut);
+    const losslessOut = `${tmpBase}.raw.m4a`;
+
+    let usedLossless = false;
+    // Try a fast, lossless demux (works if source audio is AAC).
+    const extracted = await tryExtractAudio(inputPath, losslessOut, requestId);
+    if (extracted) {
+      tempFiles.add(losslessOut);
+      const sz = statBytes(losslessOut);
+      addStep(requestId, `Lossless extract size: ${(sz / 1024 / 1024).toFixed(2)} MB`);
+      if (sz > 0 && sz <= OPENAI_AUDIO_MAX) {
+        addStep(requestId, "Using lossless extract (≤25MB).");
+        parts = [losslessOut];
+        usedLossless = true;
+      } else {
+        addStep(requestId, "Lossless extract too large or unusable — will compress.");
+      }
+    } else {
+      addStep(requestId, "No compatible audio to copy — will compress.");
+    }
+
+    // If not using lossless, proceed with planned encode/segment.
+    if (!usedLossless) {
+      const { kbps, needsSplit } = chooseBitrateAndSplit(durationSec);
+      addStep(
+        requestId,
+        `Chosen bitrate: ${kbps} kbps; ${needsSplit ? "will segment" : "single file"}.`
+      );
+
+      if (!needsSplit) {
+        const singleOut = `${tmpBase}.${kbps}k.m4a`;
+        tempFiles.add(singleOut);
+        await encodeSingleMp3(inputPath, singleOut, kbps, requestId);
+        const sz = statBytes(singleOut);
+        addStep(requestId, `Encoded size: ${(sz / 1024 / 1024).toFixed(2)} MB`);
+        if (sz > OPENAI_AUDIO_MAX) {
+          addStep(requestId, "Single file still >25MB — encoding again with segmentation …");
+          try { fs.unlinkSync(singleOut); } catch {}
+          tempFiles.delete(singleOut);
+          const segSec = computeSegmentSeconds(kbps);
+          const pattern = `${tmpBase}.part-%03d.m4a`;
+          const segs = await encodeAndSegmentMp3(inputPath, pattern, kbps, segSec, requestId);
+          segs.forEach((p) => tempFiles.add(p));
+          parts = segs;
+        } else {
+          parts = [singleOut];
+        }
+      } else {
         const segSec = computeSegmentSeconds(kbps);
-        const pattern = `${tmpBase}.part-%03d.mp3`;
+        const pattern = `${tmpBase}.part-%03d.m4a`;
         const segs = await encodeAndSegmentMp3(inputPath, pattern, kbps, segSec, requestId);
         segs.forEach((p) => tempFiles.add(p));
         parts = segs;
-      } else {
-        parts = [singleOut];
       }
-    } else {
-      const segSec = computeSegmentSeconds(kbps);
-      const pattern = `${tmpBase}.part-%03d.mp3`;
-      const segs = await encodeAndSegmentMp3(inputPath, pattern, kbps, segSec, requestId);
-      segs.forEach((p) => tempFiles.add(p));
-      parts = segs;
     }
 
     // compute duration from encoded parts
@@ -729,14 +727,11 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     }
     addStep(requestId, `Detected language: ${language || "unknown"}`);
 
-    // <<< NEW: collapse duplicate loops before translation (jibberish fix)
-    const cleanedOriginal = collapseRepeatedSentences(originalAll, requestId);
-
     // zh-TW faithful translation
     addStep(requestId, "Calling GPT 原文→繁中 (faithful, multilingual) …");
     let zhTraditional = "";
     try {
-      const inputForGpt = cleanedOriginal || "";
+      const inputForGpt = originalAll || "";
       zhTraditional = await gptTranslateFaithful(inputForGpt, requestId);
       addStep(requestId, "繁中 done.");
     } catch (_) {
@@ -750,7 +745,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
 ${zhTraditional}
 
 ＝＝ 原文 ＝＝
-${cleanedOriginal}
+${originalAll}
 `;
     const safeBase =
       (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
@@ -766,7 +761,7 @@ ${cleanedOriginal}
               .map((line) => new Paragraph(line)),
             new Paragraph(""),
             new Paragraph("＝＝ 原文 ＝＝"),
-            ...String(cleanedOriginal || "")
+            ...String(originalAll || "")
               .split("\n")
               .map((line) => new Paragraph(line)),
           ],
