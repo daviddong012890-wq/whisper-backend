@@ -558,7 +558,6 @@ async function gptTranslateFaithful(originalAll, requestId) {
   try {
     const resp = await openai.responses.create({
       model: preferred,
-      temperature: 0,
       input: [
         { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
         { role: "user",   content: [{ type: "input_text", text: originalAll || "" }] },
