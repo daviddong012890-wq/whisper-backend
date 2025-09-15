@@ -450,6 +450,12 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
 
 // ---------- OpenAI (Whisper) ----------
 async function openaiTranscribeVerbose(audioPath, requestId) {
+  // === CHANGE START: AbortController per-call timeout (industry standard) ===
+  const PER_CALL_MS = Number(process.env.WHISPER_CALL_TIMEOUT_MS || 360_000); // 6 minutes
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PER_CALL_MS);
+  // === CHANGE END ===
+
   try {
     const fd = new FormData();
     fd.append("file", fs.createReadStream(audioPath), {
@@ -458,14 +464,21 @@ async function openaiTranscribeVerbose(audioPath, requestId) {
     fd.append("model", "whisper-1");
     fd.append("response_format", "verbose_json");
     fd.append("temperature", "0");
+
     const r = await axiosOpenAI.post(
       "https://api.openai.com/v1/audio/transcriptions",
       fd,
       {
+        // === CHANGE START: make call abortable & throw on non-2xx ===
+        signal: controller.signal,
+        validateStatus: (s) => s >= 200 && s < 300,
+        // === CHANGE END ===
         headers: {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
           ...fd.getHeaders(),
         },
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
       }
     );
     return r.data;
@@ -473,9 +486,12 @@ async function openaiTranscribeVerbose(audioPath, requestId) {
     console.error(
       `[${requestId}] Whisper transcribe error:`,
       err?.response?.status,
+      err?.code || err?.name || "",
       err?.message
     );
     throw err;
+  } finally {
+    clearTimeout(timer); // === CHANGE: always clear timer
   }
 }
 
@@ -489,14 +505,18 @@ async function withRetries(fn, { maxAttempts = 5, baseDelayMs = 700 } = {}) {
     } catch (e) {
       attempt++;
       const s = e?.response?.status;
-      const code = e?.code || "";
+      const code = (e?.code || "").toString();
+
       const retriable =
         s === 429 ||
         (s >= 500 && s < 600) ||
         code === "ECONNRESET" ||
         code === "ETIMEDOUT" ||
-        code === "ECONNABORTED";
+        code === "ECONNABORTED" ||
+        code === "ERR_CANCELED"; // ← CHANGE: retry on AbortController abort
+
       if (!retriable || attempt >= maxAttempts) throw e;
+
       const delay = Math.floor(baseDelayMs * Math.pow(2, attempt - 1) + Math.random() * 250);
       await sleepMs(delay);
     }
@@ -564,7 +584,6 @@ async function gptTranslateFaithful(originalAll, requestId) {
         { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
         { role: "user",   content: [{ type: "input_text", text: originalAll || "" }] },
       ],
-      // If using reasoning models, you can optionally nudge effort:
       // reasoning: { effort: "medium" },
       // response_format: { type: "text" },
     });
