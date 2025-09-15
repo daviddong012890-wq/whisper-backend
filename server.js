@@ -252,7 +252,7 @@ const mailer = nodemailer.createTransport({
 const OPENAI_AUDIO_MAX = 25 * 1024 * 1024; // OpenAI per-file limit (25 MB)
 const TARGET_MAX_BYTES = 24 * 1024 * 1024; // aim just under
 const MIN_SEG_SECONDS = 420; // 7 min
-const MAX_SEG_SECONDS = 900; // 15 min
+const MAX_SEG_SECONDS = 600; // 10 min (reduced to lower looping risk)
 const DEFAULT_SEG_SECONDS = 900;
 
 function statBytes(p) {
@@ -379,17 +379,21 @@ function ffprobeDurationSeconds(filePath) {
 function estimateSizeBytes(seconds, kbps) {
   return Math.ceil(seconds * (kbps * 1000) / 8);
 }
-function chooseBitrateAndSplit(seconds, candidateKbps = [96, 64, 48, 32, 24, 16]) {
-  for (const kb of candidateKbps) {
+function chooseBitrateAndSplit(seconds) {
+  // Prefer clarity first if it still fits in a single file:
+  const prefer = [80, 64, 48]; // 80 if safe, else 64, else 48
+  for (const kb of prefer) {
     const est = estimateSizeBytes(seconds, kb);
     if (est <= TARGET_MAX_BYTES) {
       return { kbps: kb, needsSplit: false, estBytes: est };
     }
   }
+  // Needs segmentation — start with 64 kbps (best speech quality per byte)
+  const kbps = 64;
   return {
-    kbps: candidateKbps[candidateKbps.length - 1],
+    kbps,
     needsSplit: true,
-    estBytes: estimateSizeBytes(seconds, candidateKbps[candidateKbps.length - 1]),
+    estBytes: estimateSizeBytes(seconds, kbps),
   };
 }
 function computeSegmentSeconds(kbps) {
@@ -397,61 +401,50 @@ function computeSegmentSeconds(kbps) {
   return Math.max(MIN_SEG_SECONDS, Math.min(MAX_SEG_SECONDS, seconds || DEFAULT_SEG_SECONDS));
 }
 
-// ---------- NEW: try lossless audio extract (copy) ----------
-async function tryExtractAudio(inPath, outM4a, requestId) {
-  addStep(requestId, "Attempting lossless audio extract (no re-encode) …");
-  return new Promise((resolve) => {
-    ffmpeg(inPath)
-      .noVideo()
-      .outputOptions([
-        "-vn",
-        "-c:a", "copy",
-        "-movflags", "faststart"
-      ])
-      .save(outM4a)
-      .on("end", () => resolve(true))
-      .on("error", () => resolve(false)); // silently fall back
-  });
-}
-
-// ---------- single-pass encode helpers (switch to AAC/M4A, 64 kbps, 32 kHz) ----------
-async function encodeSingleMp3(inPath, outM4a, kbps, requestId) {
-  // (Function name kept for compatibility with your code paths)
-  addStep(requestId, `Encode AAC/M4A @ ${kbps} kbps, mono, 32 kHz (single file)…`);
+// ---------- single-pass encode helpers ----------
+async function encodeSingleMp3(inPath, outMp3, kbps, requestId) {
+  addStep(requestId, `Encode MP3 @ ${kbps} kbps (single file)…`);
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
       .audioFilters(["dynaudnorm"])
       .outputOptions([
-        "-ac", "1",
-        "-ar", "32000",
-        "-b:a", `${kbps}k`,
-        "-c:a", "aac",
-        "-movflags", "faststart"
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-b:a",
+        `${kbps}k`,
+        "-codec:a",
+        "libmp3lame",
       ])
-      .save(outM4a)
+      .save(outMp3)
       .on("end", resolve)
       .on("error", reject);
   });
-  return outM4a;
+  return outMp3;
 }
-
 async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, requestId) {
-  // (Function name kept for compatibility with your code paths)
-  addStep(requestId, `Encode+Segment AAC/M4A @ ${kbps} kbps, mono, 32 kHz, ~${segmentSeconds}s/part…`);
+  addStep(requestId, `Encode+Segment MP3 @ ${kbps} kbps, ~${segmentSeconds}s/part…`);
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
       .audioFilters(["dynaudnorm"])
       .outputOptions([
-        "-ac", "1",
-        "-ar", "32000",
-        "-b:a", `${kbps}k`,
-        "-c:a", "aac",
-        "-movflags", "faststart",
-        "-f", "segment",
-        "-segment_time", String(segmentSeconds),
-        "-reset_timestamps", "1"
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-b:a",
+        `${kbps}k`,
+        "-codec:a",
+        "libmp3lame",
+        "-f",
+        "segment",
+        "-segment_time",
+        String(segmentSeconds),
+        "-reset_timestamps",
+        "1",
       ])
       .save(outPattern)
       .on("end", resolve)
@@ -461,7 +454,7 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
   const base = path.basename(outPattern).split("%")[0];
   const files = fs
     .readdirSync(dir)
-    .filter((n) => n.startsWith(base) && n.endsWith(".m4a"))
+    .filter((n) => n.startsWith(base) && n.endsWith(".mp3"))
     .map((n) => path.join(dir, n))
     .sort();
   return files;
@@ -477,11 +470,7 @@ async function openaiTranscribeVerbose(audioPath, requestId) {
     fd.append("model", "whisper-1");
     fd.append("response_format", "verbose_json");
     fd.append("temperature", "0");
-    // Transcription-only instructions to improve detection & keep dialects verbatim
-    fd.append(
-      "prompt",
-      "For the transcription stage only: auto-detect the spoken language and transcribe verbatim in that same language. Do not translate, paraphrase, summarize, or normalize to another language (e.g., do not convert dialects into Standard Mandarin). Preserve dialect words, accent forms, code-mixed words, proper names, numbers, and punctuation exactly as spoken. Output only the transcript in the original language."
-    );
+    // NOTE: intentionally no seed prompt to avoid repetition/language drift
     const r = await axiosOpenAI.post(
       "https://api.openai.com/v1/audio/transcriptions",
       fd,
@@ -616,62 +605,38 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     const durationSec = await ffprobeDurationSeconds(inputPath);
     addStep(requestId, `Detected duration: ${Math.round(durationSec)}s`);
 
-    // PLAN: try lossless extract first; if too big, encode to AAC/M4A @64kbps; segment if needed.
+    const { kbps, needsSplit } = chooseBitrateAndSplit(durationSec);
+    addStep(
+      requestId,
+      `Chosen bitrate: ${kbps} kbps; ${needsSplit ? "will segment" : "single file"}.`
+    );
+
     let parts = [];
     const tmpBase = `/tmp/${requestId}`;
-    const losslessOut = `${tmpBase}.raw.m4a`;
-
-    let usedLossless = false;
-    // Try a fast, lossless demux (works if source audio is AAC).
-    const extracted = await tryExtractAudio(inputPath, losslessOut, requestId);
-    if (extracted) {
-      tempFiles.add(losslessOut);
-      const sz = statBytes(losslessOut);
-      addStep(requestId, `Lossless extract size: ${(sz / 1024 / 1024).toFixed(2)} MB`);
-      if (sz > 0 && sz <= OPENAI_AUDIO_MAX) {
-        addStep(requestId, "Using lossless extract (≤25MB).");
-        parts = [losslessOut];
-        usedLossless = true;
-      } else {
-        addStep(requestId, "Lossless extract too large or unusable — will compress.");
-      }
-    } else {
-      addStep(requestId, "No compatible audio to copy — will compress.");
-    }
-
-    // If not using lossless, proceed with planned encode/segment.
-    if (!usedLossless) {
-      const { kbps, needsSplit } = chooseBitrateAndSplit(durationSec);
-      addStep(
-        requestId,
-        `Chosen bitrate: ${kbps} kbps; ${needsSplit ? "will segment" : "single file"}.`
-      );
-
-      if (!needsSplit) {
-        const singleOut = `${tmpBase}.${kbps}k.m4a`;
-        tempFiles.add(singleOut);
-        await encodeSingleMp3(inputPath, singleOut, kbps, requestId);
-        const sz = statBytes(singleOut);
-        addStep(requestId, `Encoded size: ${(sz / 1024 / 1024).toFixed(2)} MB`);
-        if (sz > OPENAI_AUDIO_MAX) {
-          addStep(requestId, "Single file still >25MB — encoding again with segmentation …");
-          try { fs.unlinkSync(singleOut); } catch {}
-          tempFiles.delete(singleOut);
-          const segSec = computeSegmentSeconds(kbps);
-          const pattern = `${tmpBase}.part-%03d.m4a`;
-          const segs = await encodeAndSegmentMp3(inputPath, pattern, kbps, segSec, requestId);
-          segs.forEach((p) => tempFiles.add(p));
-          parts = segs;
-        } else {
-          parts = [singleOut];
-        }
-      } else {
+    if (!needsSplit) {
+      const singleOut = `${tmpBase}.${kbps}k.mp3`;
+      tempFiles.add(singleOut);
+      await encodeSingleMp3(inputPath, singleOut, kbps, requestId);
+      const sz = statBytes(singleOut);
+      addStep(requestId, `Encoded size: ${(sz / 1024 / 1024).toFixed(2)} MB`);
+      if (sz > OPENAI_AUDIO_MAX) {
+        addStep(requestId, "Single file still >25MB — encoding again with segmentation …");
+        try { fs.unlinkSync(singleOut); } catch {}
+        tempFiles.delete(singleOut);
         const segSec = computeSegmentSeconds(kbps);
-        const pattern = `${tmpBase}.part-%03d.m4a`;
+        const pattern = `${tmpBase}.part-%03d.mp3`;
         const segs = await encodeAndSegmentMp3(inputPath, pattern, kbps, segSec, requestId);
         segs.forEach((p) => tempFiles.add(p));
         parts = segs;
+      } else {
+        parts = [singleOut];
       }
+    } else {
+      const segSec = computeSegmentSeconds(kbps);
+      const pattern = `${tmpBase}.part-%03d.mp3`;
+      const segs = await encodeAndSegmentMp3(inputPath, pattern, kbps, segSec, requestId);
+      segs.forEach((p) => tempFiles.add(p));
+      parts = segs;
     }
 
     // compute duration from encoded parts
