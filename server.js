@@ -379,7 +379,7 @@ function ffprobeDurationSeconds(filePath) {
 function estimateSizeBytes(seconds, kbps) {
   return Math.ceil(seconds * (kbps * 1000) / 8);
 }
-function chooseBitrateAndSplit(seconds, candidateKbps = [96, 64, 48, 32, 24, 16]) {
+function chooseBitrateAndSplit(seconds, candidateKbps = [96, 80, 64]) { // <<< UPDATED LADDER
   for (const kb of candidateKbps) {
     const est = estimateSizeBytes(seconds, kb);
     if (est <= TARGET_MAX_BYTES) {
@@ -583,6 +583,43 @@ async function gptTranslateFaithful(originalAll, requestId) {
   return resp?.data?.choices?.[0]?.message?.content?.trim() || "";
 }
 
+// ---------- minimal repeat-collapser (fix Whisper loop artifacts) ----------
+function collapseRepeatedSentences(input, requestId) {
+  if (!input) return input;
+  // Split by sentence-like boundaries (handles CJK & Latin) while keeping punctuation in place.
+  const parts = input
+    .split(/(?<=[。！？!?]|(?:\.\s)|(?:\?\s)|(?:!\s)|\n)/g)
+    .map(s => s.replace(/\s+$/g, "")); // trim right to normalize
+  const out = [];
+  let lastKey = "";
+  let repeatCount = 0;
+
+  for (const raw of parts) {
+    const s = raw; // preserve original spacing/punct except trailing spaces
+    const key = s.replace(/\s+/g, " ").trim(); // normalized for comparison
+    if (!key) continue;
+
+    if (key === lastKey) {
+      repeatCount++;
+      // allow one repeat at most; drop further exact consecutive dups
+      if (repeatCount >= 1) {
+        continue;
+      }
+    } else {
+      lastKey = key;
+      repeatCount = 0;
+    }
+    out.push(s);
+  }
+
+  const result = out.join("").replace(/\n{3,}/g, "\n\n");
+  // Optional log if we actually collapsed a lot
+  if (result.length + 50 < input.length) {
+    addStep(requestId, `Collapsed repeated fragments (${input.length}→${result.length} chars).`);
+  }
+  return result;
+}
+
 // ---------- main processor ----------
 async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }) {
   await setJobStatus(requestId, "processing");
@@ -692,11 +729,14 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     }
     addStep(requestId, `Detected language: ${language || "unknown"}`);
 
+    // <<< NEW: collapse duplicate loops before translation (jibberish fix)
+    const cleanedOriginal = collapseRepeatedSentences(originalAll, requestId);
+
     // zh-TW faithful translation
     addStep(requestId, "Calling GPT 原文→繁中 (faithful, multilingual) …");
     let zhTraditional = "";
     try {
-      const inputForGpt = originalAll || "";
+      const inputForGpt = cleanedOriginal || "";
       zhTraditional = await gptTranslateFaithful(inputForGpt, requestId);
       addStep(requestId, "繁中 done.");
     } catch (_) {
@@ -710,7 +750,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
 ${zhTraditional}
 
 ＝＝ 原文 ＝＝
-${originalAll}
+${cleanedOriginal}
 `;
     const safeBase =
       (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
@@ -726,7 +766,7 @@ ${originalAll}
               .map((line) => new Paragraph(line)),
             new Paragraph(""),
             new Paragraph("＝＝ 原文 ＝＝"),
-            ...String(originalAll || "")
+            ...String(cleanedOriginal || "")
               .split("\n")
               .map((line) => new Paragraph(line)),
           ],
