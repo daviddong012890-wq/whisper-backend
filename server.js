@@ -539,7 +539,7 @@ async function gptTranslateFaithful(originalAll, requestId) {
 12) 不得意譯：除為可讀性所需的最小語序調整外，嚴禁意譯或自創資訊。`;
 
   const payload = {
-    model: "gpt-4o-mini",
+    model: "gpt-5",
     temperature: 0,
     messages: [
       { role: "system", content: systemPrompt },
