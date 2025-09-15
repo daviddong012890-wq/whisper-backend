@@ -554,7 +554,7 @@ async function gptTranslateFaithful(originalAll, requestId) {
 你是頂尖的繁體中文（台灣）本地化專家與資深筆譯員。任務是將原文（常為口語逐字稿）絕對忠實地翻譯成可在法律、新聞、學術等嚴肅場合使用的中文。
 
 2) 核心任務（Core Task）
-只翻譯 <source>...</source> 內的英文內容。輸出必須為繁體中文（台灣慣用），並嚴格遵守下列規則。
+只翻譯 <source>...</source> 內的內容（不論語言）。輸出必須為繁體中文（台灣慣用），並嚴格遵守下列規則。
 
 3) 詳細規則（Instructions）
 
@@ -564,10 +564,11 @@ A. 核心原則：忠實與中性
 
 B. 內容處理（Content Handling）
 - 標籤清理：徹底刪除所有時間戳 [hh:mm:ss]、(mm:ss)、0:07 等，以及說話者標籤（Speaker A:、人名：）。
-- 多語混雜：除人名、地名、品牌名、組織名與技術性內容（網址、檔名、程式碼）外，外語詞彙一律譯成中文。常見縮寫（AI、DNA、Wi-Fi、USB、CPU、GPU）可保留。
+- 多語混雜：除人名、地名、品牌名、組織名與技術性內容（網址、檔名、程式碼）外，外語詞彙一律譯成中文。例如，有些人說話時候會參雜兩到三種語言，但你需要貫通後一律譯成中文。常見縮寫（AI、DNA、Wi-Fi、USB、CPU、GPU）可保留。
 - 專有名詞：有台灣通行譯名必須採用；若無，可保留原文但需與中文自然融合。
-- 中文方言：若夾雜方言（如粵語、吳語），只做用字標準化為繁體與全形標點，不得改動語義。
+- 方言：若夾雜方言（如粵語、上海話、台語、閩南語），只進行文字的標準化處理，不得改動語義。
 - 重複內容：同一詞組連續出現 4 次以上，為提升可讀性，可壓縮為最多 3 次；或改為單行標記： 【重複×N：詞組】（例如：【重複×10：謝謝】）。
+- 若有百分之 30% 以上不確定中文翻譯是否正確，請在不確定的翻譯後面放：（註：請核對此翻譯）
 
 C. 格式與標點（Formatting & Punctuation）
 - 破折號與連字號全面禁用（重點）：中文正文中禁止用 —、–、- 表示停頓/轉折/補述。遇到原文 dash，一律改用「，」「、」或「（ ）」。連字號 - 只可於網址、檔名、程式碼、產品型號等需原樣保留之內容。
@@ -603,7 +604,7 @@ E. 已有中文處理
       model: preferred,
       input: [
         { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
-        { role: "user",   content: [{ type: "input_text", text: originalAll || "" }] },
+        { role: "user", content: [{ type: "input_text", text: `<source>\n${originalAll || ""}\n</source>` }] },
       ],
       // reasoning: { effort: "medium" },
       // response_format: { type: "text" },
@@ -631,7 +632,7 @@ E. 已有中文處理
   const chatCandidates = ["gpt-4.1-nano", "gpt-4o-mini"];
   const messages = [
     { role: "system", content: systemPrompt },
-    { role: "user", content: originalAll || "" },
+    { role: "user",   content: `<source>\n${originalAll || ""}\n</source>` },
   ];
 
   for (const model of chatCandidates) {
