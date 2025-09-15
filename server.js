@@ -252,8 +252,8 @@ const mailer = nodemailer.createTransport({
 const OPENAI_AUDIO_MAX = 25 * 1024 * 1024; // OpenAI per-file limit (25 MB)
 const TARGET_MAX_BYTES = 24 * 1024 * 1024; // aim just under
 const MIN_SEG_SECONDS = 420; // 7 min
-const MAX_SEG_SECONDS = 600; // 10 min (reduced to lower looping risk)
-const DEFAULT_SEG_SECONDS = 900;
+const MAX_SEG_SECONDS = 600; // 10 min (updated)
+const DEFAULT_SEG_SECONDS = 600;
 
 function statBytes(p) {
   try {
@@ -375,76 +375,86 @@ function ffprobeDurationSeconds(filePath) {
   });
 }
 
-// ---------- bitrate planning ----------
+// ---------- bitrate planning (adaptive 80/64, drop to 48 if needed) ----------
 function estimateSizeBytes(seconds, kbps) {
   return Math.ceil(seconds * (kbps * 1000) / 8);
-}
-function chooseBitrateAndSplit(seconds) {
-  // Prefer clarity first if it still fits in a single file:
-  const prefer = [80, 64, 48]; // 80 if safe, else 64, else 48
-  for (const kb of prefer) {
-    const est = estimateSizeBytes(seconds, kb);
-    if (est <= TARGET_MAX_BYTES) {
-      return { kbps: kb, needsSplit: false, estBytes: est };
-    }
-  }
-  // Needs segmentation — start with 64 kbps (best speech quality per byte)
-  const kbps = 64;
-  return {
-    kbps,
-    needsSplit: true,
-    estBytes: estimateSizeBytes(seconds, kbps),
-  };
 }
 function computeSegmentSeconds(kbps) {
   const seconds = Math.floor(TARGET_MAX_BYTES / ((kbps * 1000) / 8));
   return Math.max(MIN_SEG_SECONDS, Math.min(MAX_SEG_SECONDS, seconds || DEFAULT_SEG_SECONDS));
 }
+function chooseBitrateAndSplit(seconds) {
+  // Prefer 80 kbps if the whole clip fits under target
+  if (estimateSizeBytes(seconds, 80) <= TARGET_MAX_BYTES) {
+    return { kbps: 80, needsSplit: false, estBytes: estimateSizeBytes(seconds, 80) };
+  }
+  // Else prefer 64 kbps (split if needed)
+  if (estimateSizeBytes(seconds, 64) <= TARGET_MAX_BYTES) {
+    return { kbps: 64, needsSplit: false, estBytes: estimateSizeBytes(seconds, 64) };
+  }
+  // With 64 kbps, can we segment to keep parts under target while keeping segments >= MIN_SEG_SECONDS?
+  const seg64 = Math.floor(TARGET_MAX_BYTES / ((64 * 1000) / 8));
+  if (seg64 >= MIN_SEG_SECONDS) {
+    return { kbps: 64, needsSplit: true, estBytes: estimateSizeBytes(seconds, 64) };
+  }
+  // Otherwise drop once to 48 kbps
+  return { kbps: 48, needsSplit: true, estBytes: estimateSizeBytes(seconds, 48) };
+}
 
-// ---------- single-pass encode helpers ----------
-async function encodeSingleMp3(inPath, outMp3, kbps, requestId) {
-  addStep(requestId, `Encode MP3 @ ${kbps} kbps (single file)…`);
+// ---------- NEW: try lossless audio extract (copy) ----------
+async function tryExtractAudio(inPath, outM4a, requestId) {
+  addStep(requestId, "Attempting lossless audio extract (no re-encode) …");
+  return new Promise((resolve) => {
+    ffmpeg(inPath)
+      .noVideo()
+      .outputOptions([
+        "-vn",
+        "-c:a", "copy",
+        "-movflags", "faststart"
+      ])
+      .save(outM4a)
+      .on("end", () => resolve(true))
+      .on("error", () => resolve(false)); // silently fall back
+  });
+}
+
+// ---------- single-pass encode helpers (AAC/M4A mono 32 kHz) ----------
+async function encodeSingleMp3(inPath, outM4a, kbps, requestId) {
+  // (Function name kept for compatibility with existing calls)
+  addStep(requestId, `Encode AAC/M4A @ ${kbps} kbps, mono, 32 kHz (single file)…`);
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
       .audioFilters(["dynaudnorm"])
       .outputOptions([
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-b:a",
-        `${kbps}k`,
-        "-codec:a",
-        "libmp3lame",
+        "-ac", "1",
+        "-ar", "32000",
+        "-b:a", `${kbps}k`,
+        "-c:a", "aac",
+        "-movflags", "faststart"
       ])
-      .save(outMp3)
+      .save(outM4a)
       .on("end", resolve)
       .on("error", reject);
   });
-  return outMp3;
+  return outM4a;
 }
 async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, requestId) {
-  addStep(requestId, `Encode+Segment MP3 @ ${kbps} kbps, ~${segmentSeconds}s/part…`);
+  // (Function name kept for compatibility with existing calls)
+  addStep(requestId, `Encode+Segment AAC/M4A @ ${kbps} kbps, mono, 32 kHz, ~${segmentSeconds}s/part…`);
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
       .audioFilters(["dynaudnorm"])
       .outputOptions([
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-b:a",
-        `${kbps}k`,
-        "-codec:a",
-        "libmp3lame",
-        "-f",
-        "segment",
-        "-segment_time",
-        String(segmentSeconds),
-        "-reset_timestamps",
-        "1",
+        "-ac", "1",
+        "-ar", "32000",
+        "-b:a", `${kbps}k`,
+        "-c:a", "aac",
+        "-movflags", "faststart",
+        "-f", "segment",
+        "-segment_time", String(segmentSeconds),
+        "-reset_timestamps", "1"
       ])
       .save(outPattern)
       .on("end", resolve)
@@ -454,7 +464,7 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
   const base = path.basename(outPattern).split("%")[0];
   const files = fs
     .readdirSync(dir)
-    .filter((n) => n.startsWith(base) && n.endsWith(".mp3"))
+    .filter((n) => n.startsWith(base) && n.endsWith(".m4a"))
     .map((n) => path.join(dir, n))
     .sort();
   return files;
@@ -470,7 +480,6 @@ async function openaiTranscribeVerbose(audioPath, requestId) {
     fd.append("model", "whisper-1");
     fd.append("response_format", "verbose_json");
     fd.append("temperature", "0");
-    // NOTE: intentionally no seed prompt to avoid repetition/language drift
     const r = await axiosOpenAI.post(
       "https://api.openai.com/v1/audio/transcriptions",
       fd,
@@ -546,11 +555,7 @@ async function gptTranslateFaithful(originalAll, requestId) {
 5) 標點：使用中文全形標點。
 6) 保留網址/檔名/程式碼等原樣。
 7) 只輸出譯文正文。
-8) 原文若已是中文：統一台灣慣用詞與全形標點。
-9) 雙語與夾雜：原文可能同一句中同時包含多種語言（例如「我今天有一個很開心的一天，但是我的 cousin 跟我的 friend 他們給了我一個很大的 surprise 因為今天是我的 birthday」）。除人名、地名、品牌名、網址、檔名與程式碼外，所有外語詞彙一律譯為繁體中文，避免保留英文或拼音。對難以確定的親屬稱謂等，使用不臆測的中性繁中表達（例如「表／堂親」、「朋友」、「生日」）。
-10) 中文方言：若原文為中文方言或口語（含吳語、粵語等），不得改寫其語義；僅規整為繁體中文用字與全形標點。
-11) 專有名詞：人名、地名、品牌名可用通行中文譯名；若無通行譯名可保留原語，但仍須使用全形標點並與中文語句自然整合。
-12) 不得意譯：除為可讀性所需的最小語序調整外，嚴禁意譯或自創資訊。`;
+8) 原文若已是中文：統一台灣慣用詞與全形標點。`;
 
   const payload = {
     model: "gpt-4o-mini",
@@ -605,38 +610,60 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     const durationSec = await ffprobeDurationSeconds(inputPath);
     addStep(requestId, `Detected duration: ${Math.round(durationSec)}s`);
 
-    const { kbps, needsSplit } = chooseBitrateAndSplit(durationSec);
-    addStep(
-      requestId,
-      `Chosen bitrate: ${kbps} kbps; ${needsSplit ? "will segment" : "single file"}.`
-    );
-
+    // PLAN: try lossless extract first; if too big, encode to AAC/M4A @64/80kbps; segment if needed.
     let parts = [];
     const tmpBase = `/tmp/${requestId}`;
-    if (!needsSplit) {
-      const singleOut = `${tmpBase}.${kbps}k.mp3`;
-      tempFiles.add(singleOut);
-      await encodeSingleMp3(inputPath, singleOut, kbps, requestId);
-      const sz = statBytes(singleOut);
-      addStep(requestId, `Encoded size: ${(sz / 1024 / 1024).toFixed(2)} MB`);
-      if (sz > OPENAI_AUDIO_MAX) {
-        addStep(requestId, "Single file still >25MB — encoding again with segmentation …");
-        try { fs.unlinkSync(singleOut); } catch {}
-        tempFiles.delete(singleOut);
+    const losslessOut = `${tmpBase}.raw.m4a`;
+
+    let usedLossless = false;
+    const extracted = await tryExtractAudio(inputPath, losslessOut, requestId);
+    if (extracted) {
+      tempFiles.add(losslessOut);
+      const sz = statBytes(losslessOut);
+      addStep(requestId, `Lossless extract size: ${(sz / 1024 / 1024).toFixed(2)} MB`);
+      if (sz > 0 && sz <= OPENAI_AUDIO_MAX) {
+        addStep(requestId, "Using lossless extract (≤25MB).");
+        parts = [losslessOut];
+        usedLossless = true;
+      } else {
+        addStep(requestId, "Lossless extract too large or unusable — will compress.");
+      }
+    } else {
+      addStep(requestId, "No compatible audio to copy — will compress.");
+    }
+
+    if (!usedLossless) {
+      const { kbps, needsSplit } = chooseBitrateAndSplit(durationSec);
+      addStep(
+        requestId,
+        `Chosen bitrate: ${kbps} kbps; ${needsSplit ? "will segment" : "single file"}.`
+      );
+
+      if (!needsSplit) {
+        const singleOut = `${tmpBase}.${kbps}k.m4a`;
+        tempFiles.add(singleOut);
+        await encodeSingleMp3(inputPath, singleOut, kbps, requestId);
+        const sz = statBytes(singleOut);
+        addStep(requestId, `Encoded size: ${(sz / 1024 / 1024).toFixed(2)} MB`);
+        if (sz > OPENAI_AUDIO_MAX) {
+          addStep(requestId, "Single file still >25MB — encoding again with segmentation …");
+          try { fs.unlinkSync(singleOut); } catch {}
+          tempFiles.delete(singleOut);
+          const segSec = computeSegmentSeconds(kbps);
+          const pattern = `${tmpBase}.part-%03d.m4a`;
+          const segs = await encodeAndSegmentMp3(inputPath, pattern, kbps, segSec, requestId);
+          segs.forEach((p) => tempFiles.add(p));
+          parts = segs;
+        } else {
+          parts = [singleOut];
+        }
+      } else {
         const segSec = computeSegmentSeconds(kbps);
-        const pattern = `${tmpBase}.part-%03d.mp3`;
+        const pattern = `${tmpBase}.part-%03d.m4a`;
         const segs = await encodeAndSegmentMp3(inputPath, pattern, kbps, segSec, requestId);
         segs.forEach((p) => tempFiles.add(p));
         parts = segs;
-      } else {
-        parts = [singleOut];
       }
-    } else {
-      const segSec = computeSegmentSeconds(kbps);
-      const pattern = `${tmpBase}.part-%03d.mp3`;
-      const segs = await encodeAndSegmentMp3(inputPath, pattern, kbps, segSec, requestId);
-      segs.forEach((p) => tempFiles.add(p));
-      parts = segs;
     }
 
     // compute duration from encoded parts
@@ -692,16 +719,24 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     }
     addStep(requestId, `Detected language: ${language || "unknown"}`);
 
-    // zh-TW faithful translation
-    addStep(requestId, "Calling GPT 原文→繁中 (faithful, multilingual) …");
+    // Conditional zh-TW translation for common languages only
+    const SAFE_TRANSLATE_LANGS = new Set([
+      "en","zh","ja","ko","es","fr","de","pt","ru","vi","it","id","th","tr","ar","hi"
+    ]);
+
     let zhTraditional = "";
-    try {
-      const inputForGpt = originalAll || "";
-      zhTraditional = await gptTranslateFaithful(inputForGpt, requestId);
-      addStep(requestId, "繁中 done.");
-    } catch (_) {
-      addStep(requestId, "⚠️ GPT translation failed — sending original only.");
-      zhTraditional = "";
+    if (language && SAFE_TRANSLATE_LANGS.has(language)) {
+      addStep(requestId, "Calling GPT 原文→繁中 (faithful, multilingual) …");
+      try {
+        const inputForGpt = originalAll || "";
+        zhTraditional = await gptTranslateFaithful(inputForGpt, requestId);
+        addStep(requestId, "繁中 done.");
+      } catch (_) {
+        addStep(requestId, "⚠️ GPT translation failed — sending original only.");
+        zhTraditional = "";
+      }
+    } else {
+      addStep(requestId, "Skipping translation (language not in safe list).");
     }
 
     // email with attachments
@@ -832,7 +867,7 @@ ${originalAll}
       filename: fileName,
       request_id: requestId,
       job_id: jobId || "",
-      token: String(token || ""),
+      token: token || "",
       duration_sec: 0,
       charged_seconds: 0,
       language: "",
