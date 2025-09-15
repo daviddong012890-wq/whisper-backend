@@ -586,7 +586,7 @@ async function gptTranslateFaithful(originalAll, requestId) {
   }
 
   // Fallback to Chat Completions (stable, widely available)
-  const chatCandidates = ["gpt-4o", "gpt-4o-mini"];
+  const chatCandidates = ["gpt-4.1-nano", "gpt-4o-mini"];
   const messages = [
     { role: "system", content: systemPrompt },
     { role: "user", content: originalAll || "" },
