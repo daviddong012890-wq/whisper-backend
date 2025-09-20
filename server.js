@@ -553,23 +553,23 @@ Format the transcription so that each original sentence appears on its own line,
 For example,
 
 Hello, my name is David Garcia.
-備注：你好，我的名字是大衛·加西亞（David Garcia）
+備註：你好，我的名字是大衛·加西亞（David Garcia）
 
 I am honored to be here today, at the request of Tzi Chi Foundation and its associates.
-備注：今天應慈濟基金會（Tzu Chi Foundation）及其相關單位之邀，能夠在此與各位相聚，我深感榮幸。
+備註：今天應慈濟基金會（Tzu Chi Foundation）及其相關單位之邀，能夠在此與各位相聚，我深感榮幸。
 
 It's fortunate that I made it to my speech, because my Tesla ran out of battery at the intersection of Azusa Avenue and the 10 Freeway, next to Taco Gavilan.
-備注：雖然我的特斯拉（Tesla）在阿蘇薩大道（Azusa Avenue）與 10 號高速公路交會處、塔可加維蘭（Taco Gavilan）餐廳旁邊沒電了，幸運的是，我還是趕上了演講。
+備註：雖然我的特斯拉（Tesla）在阿蘇薩大道（Azusa Avenue）與 10 號高速公路交會處、塔可加維蘭（Taco Gavilan）餐廳旁邊沒電了，幸運的是，我還是趕上了演講。
 
 I'm happy to join the buddha birthday festival, hey give me that cake, to celebrate and rejoice, with hand me the cup please my family, and friends from all over.
-備注：我很高興參加佛誕節，嘿，給我那個蛋糕，來慶祝和歡喜，和遞給我杯子，請，我的家人，還有來自各地的朋友。
+備註：我很高興參加佛誕節，嘿，給我那個蛋糕，來慶祝和歡喜，和遞給我杯子，請，我的家人，還有來自各地的朋友。
 備註2：此句內容中可能包含非語意片段或背景雜音。根據上下文判斷，較可能的語意為：「我很高興能參加佛誕節慶典，能和家人及來自各地的朋友一起慶祝。」其餘詞語如「嘿、給我那個蛋糕、遞給我杯子」可能為環境聲或非語意插入，尚待進一步確認。
 
 -end of example-
 
-Rules for the 備註 translation: 
+Following are rules for the 備註： translation
 
-Note: For each non‑Chinese (non‑Mandarin) sentence I give you, produce the output in the following format:
+For each non‑Chinese (non‑Mandarin) sentence I give you, produce the output in the following format:
 
 [Original sentence]  
 備註：[Full translation in Traditional Chinese, following the rules below]  
@@ -584,7 +584,7 @@ with a blank line between entries.
 - 3.D) Ensure Newsworthy Accuracy: The translation must be accurate and appropriate for a serious news report.
 - 3.E) No Explanation Needed: Do not explain your choices or describe your process. Simply provide the translation in the format described above.
 - 4. Multiple proper nouns → Translate each according to rules 1–2, keeping the original in parentheses after each.
-- 5. No omissions → Every element of the original sentence must be represented in the 備註 translation.
+- 5. No omissions → Every element of the original sentence must be represented in the 備註：translation.
 - 6. Punctuation → Use correct Traditional Chinese punctuation.
 - 7. If there is nothing to translate or explain (e.g., the sentence is already fully in Chinese — which sometimes happens when a bilingual speaker switches entirely into Chinese from another language), output:
 
@@ -595,14 +595,14 @@ with a blank line between entries.
 - 8. If the transcribed sentence contains words or phrases that appear to be non-semantic, disconnected, or likely caused by background noise, filler speech, or environmental interruption, add a second line labeled 備註2：
 - 8.A) In 備註2：, provide a contextually inferred version of the sentence in correct Traditional Chinese, using natural grammar and sentence order.
 - 8.B) Use the following disclaimer format:
-備注2：此句內容中可能包含非語意片段或背景雜音。根據上下文判斷，較可能的語意為：「[inferred sentence]」。其餘詞語如「[list suspected noise]」可能為環境聲或非語意插入，尚待進一步確認。
+備註2：此句內容中可能包含非語意片段或背景雜音。根據上下文判斷，較可能的語意為：「[inferred sentence]」。其餘詞語如「[list suspected noise]」可能為環境聲或非語意插入，尚待進一步確認。
 - 8.C) Only include 備註2： when such fragments are present. If the sentence is clean and coherent, do not generate 備註2.
-- 8.D) Do not remove any words from the literal 備註：備註 2：is for interpretation only.
+- 8.D) Do not remove any words from the literal 備註：；備註2：is for interpretation only.
 - 8.E) If sentence requires 備注2：please format it as follows:
 
 [Original sentence]
-備注：
-備注2：
+備註：
+備註2：
 with a blank line between entries.
 
 - end of rule for all lanagues that are not Chinese -
@@ -612,31 +612,31 @@ When the original language is already Chinese, follow a different set of rules: 
 For example,
 
 大家好，我的名字是李允樂。
-備注：『李允樂』為人名，譯字可能有誤，請審核。
+備註：『李允樂』為人名，譯字可能有誤，請審核。
 
 嗯，今天，嗯，今天，真的很開心能夠來到慈濟，嗯，是我的 cousin 帶我來的。
 備註：cousin 為英文泛稱，指父母兄弟姐妹的子女，中文需依實際關係譯為「堂哥／堂姐／堂弟／堂妹」或「表哥／表姐／表弟／表妹」。此處因關係不明，暫保留原文。
 
 剛剛我們開車開到一半，結果車子抛錨了，哈哈，還好旁邊的 Taco Gavilan 有個兄弟，他的副業是修車，幫我們解決了才沒讓我們遲到。
-備注：Taco Gavilan（塔可加維蘭）為美國加州的墨西哥快餐連鎖餐廳名稱，主打塔可、墨西哥捲餅等料理。
+備註：Taco Gavilan（塔可加維蘭）為美國加州的墨西哥快餐連鎖餐廳名稱，主打塔可、墨西哥捲餅等料理。
 
 我們就能順利的上去十號 Freeway 從 Cal Poly 那裏下來，但是經過 San Dimas 的 Cypress Street 那裏碰到了車禍。
-備注：我們就能順利地上去十號高速公路（Freeway 10），從加州州立理工大學波莫納分校（Cal Poly Pomona）那裡下來，但是經過聖迪馬斯市（San Dimas）的賽普勒斯街（Cypress Street）時碰到了車禍。
+備註：我們就能順利地上去十號高速公路（Freeway 10），從加州州立理工大學波莫納分校（Cal Poly Pomona）那裡下來，但是經過聖迪馬斯市（San Dimas）的賽普勒斯街（Cypress Street）時碰到了車禍。
 
 感謝各位師兄師姐，感謝菩薩保佑，我們一家人平平安安的抵達到這裏，與你們見面。
-備注：-
+備註：-
 
 接下來，我們有請我們的，給我蛋糕跟水杯，李律慈師姐來，我一個就夠了，給我們說今天的活動吧。
-備注：『李律慈』為人名，譯字可能有誤，請審核。
-備注2：此句內容中可能包含非語意片段或背景雜音。根據上下文判斷，較可能的語意為：「接下來，我們有請我們的李律慈師姐，來給我們說今天的活動吧。」其餘詞語如「給我蛋糕跟水杯、我一個就夠了」可能為環境聲或非語意插入，尚待進一步確認。
+備註：『李律慈』為人名，譯字可能有誤，請審核。
+備註2：此句內容中可能包含非語意片段或背景雜音。根據上下文判斷，較可能的語意為：「接下來，我們有請我們的李律慈師姐，來給我們說今天的活動吧。」其餘詞語如「給我蛋糕跟水杯、我一個就夠了」可能為環境聲或非語意插入，尚待進一步確認。
 
 -end of example-
 
 Using about example, recognize the pattern that:
 - Keep the original sentence exactly as it is (do not alter wording, do not remove any words, except for minimal punctuation correction if needed).
 - On the next line, write 備註： followed by an explanation in Traditional Chinese, for the following:
-- In the 備註 section, when necessary, identify and clarify in parentheses immediately following any proper nouns, foreign terms, place names, organization names, or personal names that appear in the sentence, if the origin (person, place, or entity) is non-Chinese.
-- For personal names (when the transcription identifies a person’s name): State that it is a personal name, note that the Chinese characters may be inaccurate, and request review. Example: 『李允樂』為人名，譯字可能有誤，請審核。Use the format: 備注：『name』為人名，譯字可能有誤，請審核。
+- In the 備註： section, when necessary, identify and clarify in parentheses immediately following any proper nouns, foreign terms, place names, organization names, or personal names that appear in the sentence, if the origin (person, place, or entity) is non-Chinese.
+- For personal names (when the transcription identifies a person’s name): State that it is a personal name, note that the Chinese characters may be inaccurate, and request review. Example: 備註：『李允樂』為人名，譯字可能有誤，請審核。Always use the format 備註：『name』為人名，譯字可能有誤，請審核。
 - When identified bilingual speaking, kinship terms in English (e.g., cousin): explain that it is a generic English term, give the possible precise Chinese equivalents, and note if the relationship is unknown, keeping the original word if needed.
 - For place names, things and objects, such as institutions or street names (person, place or thing): if it's not Chinese, give the full Traditional Chinese translation, followed by the original term in parentheses, and briefly describe what or where it is.
 - If the sentence contains multiple such terms that are not Chinese, list each in the 備註, placing its explanation in parentheses immediately after the Traditional Chinese translation of that person, place, or thing.
@@ -664,8 +664,8 @@ with a blank line between entries.
 - If sentence requires 備注2：please format it as follows:
 
 [Original sentence]
-備注：
-備注2：
+備註：
+備註2：
 with a blank line between entries.
 
 NOTICE: Important things you should know and follow:
