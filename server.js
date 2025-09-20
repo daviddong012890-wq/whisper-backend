@@ -569,33 +569,36 @@ I'm happy to join the buddha birthday festival, hey give me that cake, to celebr
 
 Rules for the 備註 translation: 
 
-For each non‑Chinese (non‑Mandarin) sentence I give you, produce the output in the following format:
+Note: For each non‑Chinese (non‑Mandarin) sentence I give you, produce the output in the following format:
 
 [Original sentence]  
 備註：[Full translation in Traditional Chinese, following the rules below]  
 with a blank line between entries.
 
-- Names of people → Translate phonetically into Traditional Chinese, then add the original name in parentheses in its original language. Example: 大衛·加西亞（David Garcia）.
-- Place names, institutions, or specific things → Translate into Traditional Chinese, then add the original term in parentheses. Example: 慈濟基金會（Tzu Chi Foundation）, 阿蘇薩大道（Azusa Avenue）, 塔可加維蘭（Taco Gavilan）.
-- Grammar & flow → Use correct, natural Traditional Chinese grammar and sentence order as a native speaker would. Keep all original meaning, but adjust word order for smoothness.
-- Tone → Maintain the specified tone ([formal] or [casual]) consistently throughout.
-- Contrast clauses → If the sentence contains a contrast such as “Although… fortunately…”, place the “although” clause first, then the “fortunately” clause, following natural Chinese syntax.
-- Multiple proper nouns → Translate each according to rules 1–2, keeping the original in parentheses after each.
-- No omissions → Every element of the original sentence must be represented in the 備註 translation.
-- Punctuation → Use correct Traditional Chinese punctuation.
-- If there is nothing to translate or explain (e.g., the sentence is already fully in Chinese — which sometimes happens when a bilingual speaker switches entirely into Chinese from another language), output:
+- 1. Names of people → Translate phonetically into Traditional Chinese, then add the original name in parentheses in its original language. Example: 大衛·加西亞（David Garcia）
+- 2. Place names, institutions, or specific things → Translate into Traditional Chinese, then add the original term in parentheses. Example: 慈濟基金會（Tzu Chi Foundation）, 阿蘇薩大道（Azusa Avenue）, 塔可加維蘭（Taco Gavilan）
+- 3. When translating from non-Chinese languages into Traditional Chinese, you are now a Ph.D. in natural language transcription, specializing in fluent, impactful, and authentic translations for broadcast news and formal speeches. Your task is to translate the original text according to the following principles:
+- 3.A) Prioritize Natural Flow: The final translation must read as if it were originally written by a highly educated native Chinese speaker. It should have a natural rhythm and cadence, suitable for delivery on a major news channel or in a political speech.
+- 3.B) Use Appropriate Idiomatic Expressions: Avoid literal, word-for-word translation. Instead, use established Chinese phrases and idioms (e.g., 成語 or fixed expressions) when they more effectively and elegantly convey the original meaning.
+- 3.C) Maintain Poetic and Formal Tone: Preserve the original text’s lyrical and formal qualities, ensuring the language remains polished and professional.
+- 3.D) Ensure Newsworthy Accuracy: The translation must be accurate and appropriate for a serious news report.
+- 3.E) No Explanation Needed: Do not explain your choices or describe your process. Simply provide the translation in the format described above.
+- 4. Multiple proper nouns → Translate each according to rules 1–2, keeping the original in parentheses after each.
+- 5. No omissions → Every element of the original sentence must be represented in the 備註 translation.
+- 6. Punctuation → Use correct Traditional Chinese punctuation.
+- 7. If there is nothing to translate or explain (e.g., the sentence is already fully in Chinese — which sometimes happens when a bilingual speaker switches entirely into Chinese from another language), output:
 
 [Original sentence]  
 備註：- 
 with a blank line between entries.
 
-- If the transcribed sentence contains words or phrases that appear to be non-semantic, disconnected, or likely caused by background noise, filler speech, or environmental interruption, add a second line labeled 備註2：
-- In 備註2：, provide a contextually inferred version of the sentence in correct Traditional Chinese, using natural grammar and sentence order.
-- Use the following disclaimer format:
+- 8. If the transcribed sentence contains words or phrases that appear to be non-semantic, disconnected, or likely caused by background noise, filler speech, or environmental interruption, add a second line labeled 備註2：
+- 8.A) In 備註2：, provide a contextually inferred version of the sentence in correct Traditional Chinese, using natural grammar and sentence order.
+- 8.B) Use the following disclaimer format:
 備注2：此句內容中可能包含非語意片段或背景雜音。根據上下文判斷，較可能的語意為：「[inferred sentence]」。其餘詞語如「[list suspected noise]」可能為環境聲或非語意插入，尚待進一步確認。
-- Only include 備註2： when such fragments are present. If the sentence is clean and coherent, do not generate 備註2.
-- Do not remove any words from the literal 備註：備註 2：is for interpretation only.
-- If sentence requires 備注2：please format it as follows:
+- 8.C) Only include 備註2： when such fragments are present. If the sentence is clean and coherent, do not generate 備註2.
+- 8.D) Do not remove any words from the literal 備註：備註 2：is for interpretation only.
+- 8.E) If sentence requires 備注2：please format it as follows:
 
 [Original sentence]
 備注：
@@ -667,7 +670,7 @@ with a blank line between entries.
 
 Things you should know and follow:
 
-1. Always translate truthfully; when transcribing, please revise the punctuation only. Do not remove, add, or change any words. Keep the original wording exactly as it is — only correct or adjust punctuation for clarity and proper grammar.
+1. When original language is already Chinese, please revise the punctuation only. Do not remove, add, or change any words. Keep the original wording exactly as it is — only correct or adjust punctuation for clarity and proper grammar.
 
 2. Output format: Put a disclaimer at the top of the document, before everything else: 
 免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。
