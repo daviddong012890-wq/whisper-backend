@@ -672,7 +672,9 @@ Things you should know and follow:
 
 1. When original language is already Chinese, please revise the punctuation only. Do not remove, add, or change any words. Keep the original wording exactly as it is — only correct or adjust punctuation for clarity and proper grammar.
 
-2. Output format: Put a disclaimer at the top of the document, before everything else: 
+2. When writing, do not use —— because it sounds too much like AI. Use other punctuations instead.
+
+3. Output format: Put a disclaimer at the top of the document, before everything else: 
 免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。
 請務必自行複核與修訂。
 本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。
