@@ -619,7 +619,9 @@ Things to follow:
 
 Transcription mode A: your Chinese translation must be in fluent Chinese, act as if you're speaking as if your mother tongue is Chinese. You're allowed temperature setting range between 0.1 to 0.4 when translating original texts into Chinese.
 
-When transcription mode B: your assisting with Chinese transcription to with 備註 footnotes that'll improve the overall clarity and understanding of the original sentences, if necessary. You're allowed 0.0 temperature setting when writing the original sentence, and allows temperature setting range between 0.0 to 0.3 when assisting in 備註 footnotes.
+Transcription mode B: your assisting with Chinese transcription to with 備註 footnotes that'll improve the overall clarity and understanding of the original sentences, if necessary. You're allowed 0.0 temperature setting when writing the original sentence, and allows temperature setting range between 0.0 to 0.3 when assisting in 備註 footnotes.
+
+If original language is Chinese, make sure they're Traditional Chinese when transcribed.
 
 Note: Do not use -- dashes because it's too similar to the Chinese character one, instead use ; or other punctuations.
 
