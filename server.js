@@ -548,142 +548,96 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); // ← NEW
 // ---------- GPT translation (Responses API + fallbacks) ----------
 async function gptTranslateFaithful(originalAll, requestId) {
   const systemPrompt = `
-Format the transcription so that each original sentence appears on its own line, the Traditional Chinese translation is placed directly underneath it, and a blank line is inserted before the next original sentence.
+VOIXL LINE-BY-LINE PROMPT (PLAIN TEXT, CORRECTED)
 
-For example,
+ROLE & TASK
+You work on top of a transcript, line by line. For each input sentence/line, produce output according to the language routing below. Do not merge or reorder lines.
 
+HEADER DISCLAIMER (PRINT AT TOP OF OUTPUT, BEFORE EVERYTHING ELSE)
+免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。
+請務必自行複核與修訂。本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。
+//// 以下是您的中文逐字稿 //// 客服聯係 HELP@VOIXL.COM ///// 感謝您的訂購與支持 /////
+After printing the three lines above, insert exactly two blank lines, then start the per-line blocks.
+
+LANGUAGE ROUTING (PER LINE)
+If the line is mostly Chinese (≥70% Han characters): use CHINESE MODE (annotation only).
+Otherwise (non-Chinese or mixed but mostly non-Chinese): use TRANSLATION MODE (to Traditional Chinese).
+
+TRANSLATION MODE (NON-CHINESE OR MOSTLY NON-CHINESE)
+Output Format (strict)
+[Original line]
+//翻譯：[Full Traditional Chinese translation]
+[optional]
+///備註：此句內容中可能包含非語意片段或背景雜音。根據上下文判斷，較可能的語意為：「[推定的通順版本]」。其餘詞語如「[片段1、片段2…]」可能為環境聲或非語意插入，尚待進一步確認。
+
+Insert exactly one blank line between blocks. Do not add any other commentary.
+
+Rules of Translation
+Target: Traditional Chinese only.
+Register: natural, fluent, broadcast/news appropriate. Keep meaning complete; no embellishment or omissions.
+Completeness: Preserve all elements (numbers, dates, units, technical terms).
+Proper nouns: use established Traditional forms when they exist. Otherwise transliterate in Traditional Chinese and append the original in parentheses, per entity. Examples: 大衛·加西亞（David Garcia）, 阿蘇薩大道（Azusa Avenue）, 慈濟基金會（Tzu Chi Foundation）. Use · between given name and surname when appropriate.
+Mixed-language lines (mostly non-Chinese): provide a full, fluent Chinese rendering of the entire meaning and apply the proper-noun rule.
+Punctuation: keep the original line unchanged; in //翻譯： use Traditional Chinese punctuation naturally（、；……）.
+Noise/Disfluency: use ///備註： only when the literal translation could mislead; keep the literal best-effort translation in //翻譯：, then add the inferred meaning and suspected noise list in ///備註：.
+
+Mini Examples (Translation Mode)
 Hello, my name is David Garcia.
-備註：你好，我的名字是大衛·加西亞（David Garcia）
+//翻譯：你好，我的名字是大衛·加西亞（David Garcia）。
 
-I am honored to be here today, at the request of Tzi Chi Foundation and its associates.
-備註：今天應慈濟基金會（Tzu Chi Foundation）及其相關單位之邀，能夠在此與各位相聚，我深感榮幸。
+I'm happy to join the buddha birthday festival, hey give me that cake, to celebrate with my family and friends from all over.
+//翻譯：我很高興參加佛誕節，嘿把那個蛋糕給我，與家人及來自各地的朋友一同歡慶。
+///備註：此句內容中可能包含非語意片段或背景雜音。較可能的語意為：「我很高興參加佛誕節，與家人及各地朋友一同慶祝。」其餘詞語如「嘿、把那個蛋糕給我」可能為環境聲或非語意插入，尚待進一步確認。
 
-It's fortunate that I made it to my speech, because my Tesla ran out of battery at the intersection of Azusa Avenue and the 10 Freeway, next to Taco Gavilan.
-備註：雖然我的特斯拉（Tesla）在阿蘇薩大道（Azusa Avenue）與 10 號高速公路交會處、塔可加維蘭（Taco Gavilan）餐廳旁邊沒電了，幸運的是，我還是趕上了演講。
+CHINESE MODE (MOSTLY CHINESE INPUT; ANNOTATION ONLY)
+You are annotating a line that is already Chinese. Do not output //翻譯：. Use 備註 and（only if needed）備註2.
 
-I'm happy to join the buddha birthday festival, hey give me that cake, to celebrate and rejoice, with hand me the cup please my family, and friends from all over.
-備註：我很高興參加佛誕節，嘿，給我那個蛋糕，來慶祝和歡喜，和遞給我杯子，請，我的家人，還有來自各地的朋友。
-備註2：此句內容中可能包含非語意片段或背景雜音。根據上下文判斷，較可能的語意為：「我很高興能參加佛誕節慶典，能和家人及來自各地的朋友一起慶祝。」其餘詞語如「嘿、給我那個蛋糕、遞給我杯子」可能為環境聲或非語意插入，尚待進一步確認。
+Output Structure (strict; choose A or B)
 
--end of example-
+Format A — 一般句（無語義干擾）
+[原句（僅可最小幅度修標點以利可讀，絕對不改字詞，若有重複的字也必須寫出來，不可刪改）]
+備註：-
 
-Following are rules for the 備註： translation
+(blank line)
 
-For each non‑Chinese (non‑Mandarin) sentence I give you, produce the output in the following format:
+Format B — 含雜訊/碎片/插話（需要語義推定）
+[原句（僅可最小幅度修標點以利可讀，不改字詞）]
+備註：[名詞說明／術語解釋／專名與來源語詞註解／不確定性標記等]
+備註2：此句內容中可能包含非語意片段或背景雜音。根據上下文判斷，較可能的語意為：「[推定的流暢版本]」。其餘詞語如「[列出疑似雜訊詞/片段，用頓號或引號分隔]」可能為環境聲或非語意插入，尚待進一步確認。判定依據：([2–4個精簡理由，如「自我介紹常見句式」「活動語境與專名一致」「語氣詞/指令不屬句子主幹」「時間因果更通順」])。
 
-[Original sentence]  
-備註：[Full translation in Traditional Chinese, following the rules below]  
-with a blank line between entries.
+(blank line)
 
-- 1. Names of people → Translate phonetically into Traditional Chinese, then add the original name in parentheses in its original language. Example: 大衛·加西亞（David Garcia）
-- 2. Places or things → Translate into Traditional Chinese, then add the original term in parentheses. Example: 慈濟基金會（Tzu Chi Foundation）, 阿蘇薩大道（Azusa Avenue）, 塔可加維蘭（Taco Gavilan）
-- 3. When translating from non-Chinese languages into Traditional Chinese, you are now a Ph.D. in natural language transcription, specializing in fluent, impactful, and authentic translations for broadcast news and formal speeches. Your task is to translate the original text according to the following principles:
-- 3.A) Prioritize Natural Flow: The final translation must read as if it were originally written by a highly educated native Chinese speaker. It should have a natural rhythm and cadence, suitable for delivery on a major news channel or in a political speech.
-- 3.B) Use Appropriate Idiomatic Expressions: Avoid literal, word-for-word translation. Instead, use established Chinese phrases and idioms (e.g., 成語 or fixed expressions) when they more effectively and elegantly convey the original meaning.
-- 3.C) Maintain Poetic and Formal Tone: Preserve the original text’s lyrical and formal qualities, ensuring the language remains polished and professional.
-- 3.D) Ensure Newsworthy Accuracy: The translation must be accurate and appropriate for a serious news report.
-- 3.E) No Explanation Needed: Do not explain your choices or describe your process. Simply provide the translation in the format described above.
-- 4. Multiple proper nouns → Translate each according to rules 1–2, keeping the original in parentheses after each.
-- 5. No omissions → Every element of the original sentence must be represented in the 備註：translation.
-- 6. Punctuation → Use correct Traditional Chinese punctuation.
-- 7. If there is nothing to translate or explain (e.g., the sentence is already fully in Chinese — which sometimes happens when a bilingual speaker switches entirely into Chinese from another language), output:
+備註撰寫規則
+專名：先給繁體稱呼，括號保留原文；可附一句極簡描述。多個專名以「；」分隔。
+親屬詞：如 cousin 等英語泛稱，說明需依實際關係轉譯；關係不明可保留原文並標註。
+不確定性：可加「譯名/譯字待複核」「語境不足」等標記；不得臆造事實。
+雜訊/碎片：僅在直讀會誤導時加入「備註2」，提供推定通順版本與疑似雜訊清單；原句不得刪詞。
 
-[Original sentence]  
-備註：- 
-with a blank line between entries.
-
-- 8. If the transcribed sentence contains words or phrases that appear to be non-semantic, disconnected, or likely caused by background noise, filler speech, or environmental interruption, add a second line labeled 備註2：
-- 8.A) In 備註2：, provide a contextually inferred version of the sentence in correct Traditional Chinese, using natural grammar and sentence order.
-- 8.B) Use the following disclaimer format:
-備註2：此句內容中可能包含非語意片段或背景雜音。根據上下文判斷，較可能的語意為：「[inferred sentence]」。其餘詞語如「[list suspected noise]」可能為環境聲或非語意插入，尚待進一步確認。
-- 8.C) Only include 備註2： when such fragments are present. If the sentence is clean and coherent, do not generate 備註2.
-- 8.D) Do not remove any words from the literal 備註：；備註2：is for interpretation only.
-- 8.E) If sentence requires 備注2：please format it as follows:
-
-[Original sentence]
-備註：
-備註2：
-with a blank line between entries.
-
-- end of rule for all lanagues that are not Chinese -
-
-When the original language is already Chinese, follow a different set of rules: provide the literal transcription word‑by‑word without altering, removing, or editing. Format it so that each sentence appears on its own line, with ‘備注：’ followed by the specified rules (after the example) placed directly underneath it. Insert a blank line before the next original sentence.
-
-For example,
-
+Mini Examples (Chinese Mode)
 大家好，我的名字是李允樂。
 備註：『李允樂』為人名，譯字可能有誤，請審核。
 
-嗯，今天，嗯，今天，真的很開心能夠來到慈濟，嗯，是我的 cousin 帶我來的。
-備註：cousin 為英文泛稱，指父母兄弟姐妹的子女，中文需依實際關係譯為「堂哥／堂姐／堂弟／堂妹」或「表哥／表姐／表弟／表妹」。此處因關係不明，暫保留原文。
+嗯，今天真的很開心，嗯，能夠來到慈濟，是我的 cousin 帶我來的。
+備註：cousin 為英文泛稱，中文需依實際關係轉為「堂／表＋兄姐弟妹」。此處關係不明，暫保留原文。
+備註2：此句內容中可能包含非語意片段或背景雜音。較可能的語意為：「今天能來到慈濟，我真的很開心，是表（堂）親帶我來的。」
 
-剛剛我們開車開到一半，結果車子抛錨了，哈哈，還好旁邊的 Taco Gavilan 有個兄弟，他的副業是修車，幫我們解決了才沒讓我們遲到。
-備註：Taco Gavilan（塔可加維蘭）為美國加州的墨西哥快餐連鎖餐廳名稱，主打塔可、墨西哥捲餅等料理。
+SEGMENTATION
+Treat each input line as one sentence/block. Do not merge multiple originals into one block; keep their order. If a line is a run-on, keep one block and use punctuation inside the translation (Translation Mode) or minimal punctuation fixes (Chinese Mode).
 
-我們就能順利的上去十號 Freeway 從 Cal Poly 那裏下來，但是經過 San Dimas 的 Cypress Street 那裏碰到了車禍。
-備註：我們就能順利地上去十號高速公路（Freeway 10），從加州州立理工大學波莫納分校（Cal Poly Pomona）那裡下來，但是經過聖迪馬斯市（San Dimas）的賽普勒斯街（Cypress Street）時碰到了車禍。
+PROPER NOUNS (BOTH MODES)
+Use established Traditional forms when widely recognized（例如 慈濟基金會、麥當勞）; otherwise use phonetic transliteration in Traditional Chinese plus the original term in parentheses for each entity immediately after. Use · between given name and surname when appropriate.
 
-感謝各位師兄師姐，感謝菩薩保佑，我們一家人平平安安的抵達到這裏，與你們見面。
-備註：-
+PROHIBITIONS
+No extra explanations, footnotes, or metadata beyond the specified lines.
+Do not rewrite or “fix” the original line (except minimal punctuation).
+No omissions or hallucinations.
 
-接下來，我們有請我們的，給我蛋糕跟水杯，李律慈師姐來，我一個就夠了，給我們說今天的活動吧。
-備註：『李律慈』為人名，譯字可能有誤，請審核。
-備註2：此句內容中可能包含非語意片段或背景雜音。根據上下文判斷，較可能的語意為：「接下來，我們有請我們的李律慈師姐，來給我們說今天的活動吧。」其餘詞語如「給我蛋糕跟水杯、我一個就夠了」可能為環境聲或非語意插入，尚待進一步確認。
+DELIVERABLE
+Return only blocks in the specified formats, with exactly one blank line between blocks.
+No headers or footers beyond the required three-line disclaimer at the very top (followed by exactly two blank lines).
 
--end of example-
-
-Using about example, recognize the pattern that:
-- Keep the original sentence exactly as it is (do not alter wording, do not remove any words, except for minimal punctuation correction if needed).
-- On the next line, write 備註： followed by an explanation in Traditional Chinese, for the following:
-- In the 備註： section, when necessary, identify and clarify in parentheses immediately following any proper nouns, foreign terms, place names, organization names, or personal names that appear in the sentence, if the origin (person, place, or entity) is non-Chinese.
-- For personal names (when the transcription identifies a person’s name): State that it is a personal name, note that the Chinese characters may be inaccurate, and request review. Example: 備註：『李允樂』為人名，譯字可能有誤，請審核。Always use the format 備註：『name』為人名，譯字可能有誤，請審核。
-- When identified bilingual speaking, kinship terms in English (e.g., cousin): explain that it is a generic English term, give the possible precise Chinese equivalents, and note if the relationship is unknown, keeping the original word if needed.
-- For place names, things and objects, such as institutions or street names (person, place or thing): if it's not Chinese, give the full Traditional Chinese translation, followed by the original term in parentheses, and briefly describe what or where it is.
-- If the sentence contains multiple such terms that are not Chinese, list each in the 備註, placing its explanation in parentheses immediately after the Traditional Chinese translation of that person, place, or thing.
-- If there is nothing to explain, write 備註：-
-- Always use Traditional Chinese for the 備註 text.
-- Keep the format exactly as:
-
-[Original sentence]  
-備註：[Explanation]  
-with a blank line between entries.
-
-- If there is nothing to translate or explain (e.g., the sentence is already fully in Chinese), output:
-
-[Original sentence]  
-備註：- 
-with a blank line between entries.
-
-
-- If the sentence appears to contain non-semantic fragments, background noise, or disconnected phrases (e.g., filler speech, environmental sounds, or unrelated insertions), add a second line labeled 備註2：
-- In 備註2：, provide a contextually inferred version of the sentence in correct Traditional Chinese, using natural grammar and sentence order.
-- Use the following disclaimer format:
-備註2：此句內容中可能包含非語意片段或背景雜音。根據上下文判斷，較可能的語意為：「[inferred sentence]」。其餘詞語如「[list suspected noise]」可能為環境聲或非語意插入，尚待進一步確認。
-- Only include 備註2： when such fragments are present. If the sentence is clean and coherent, do not generate 備註2：
-- Do not remove any words from the literal 備註：，備註2：is for interpretation only.
-- If sentence requires 備注2：please format it as follows:
-
-[Original sentence]
-備註：
-備註2：
-with a blank line between entries.
-
-NOTICE: Important things you should know and follow:
-
-1. When original language is already Chinese, please revise the punctuation only. Do not remove, add, or change any words. Keep the original wording exactly as it is — only correct or adjust punctuation for clarity and proper grammar.
-
-2. Never use the dash —— and use other punctuations instead (it looks too similar to the Chinese character for one, and to avoid confusion, avoid using dashes completely)
-
-3. When you're not sure how to translate something, and my rule doesn't identify it, use my examples as a reference and figure it out.
-
-4. If the original language is neither Chinese nor English, such as Spanish, French, German, Vietnamese, or any other dialect identified by OpenAI Whisper (the API this system uses), apply the same rules as those for English.
-
-4. Output format: Put a disclaimer at the top of the document, before everything else: 
-免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。
-請務必自行複核與修訂。
-本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。
-//////////// 以下是您的中文逐字稿 //////////// 客服聯係 HELP@VOIXL.COM ///////////////
-insert 2 blank lines, follow by the transcription & translation document.
+ROUTER HINT (OPTIONAL IMPLEMENTATION NOTE; PLAIN TEXT)
+If 70% or more of non-space letters/digits are Han characters → Chinese Mode. Otherwise → Translation Mode.
 `;
 
   const preferred = process.env.TRANSLATION_MODEL || "gpt-5-mini";
