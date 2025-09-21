@@ -13,7 +13,7 @@ import http from "http";
 import https from "https";
 import { Pool } from "pg";
 import { Document, Packer, Paragraph } from "docx";
-import OpenAI from "openai"; // ← NEW
+import OpenAI from "openai";
 
 // ---------- notify PHP (worker-consume.php) ----------
 const CONSUME_URL = process.env.CONSUME_URL || "";
@@ -37,7 +37,6 @@ async function consume(payload) {
 }
 
 // ---------- notify PHP dashboard (worker-callback.php) ----------
-// CHANGED: send request_id (not job_id)
 async function updateStatus(requestId, status, durationSec = 0) {
   if (!CALLBACK_URL) return;
   try {
@@ -191,9 +190,9 @@ pool
   });
 
 /** -------------------------------------------------------
- *  Ensure required tables exist (auto-migrate on boot)
- *  - jobs           (requestid, status, steps jsonb, error, created_at)
- *  - transcriptions (columns your code writes to)
+ * Ensure required tables exist (auto-migrate on boot)
+ * - jobs          (requestid, status, steps jsonb, error, created_at)
+ * - transcriptions (columns your code writes to)
  * ------------------------------------------------------ */
 async function ensureSchema() {
   await pool.query(`
@@ -209,23 +208,23 @@ async function ensureSchema() {
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS transcriptions (
-      id                 BIGSERIAL PRIMARY KEY,
-      timestamputc       TIMESTAMPTZ NOT NULL,
-      timestamplocal     TEXT NOT NULL,
-      email              TEXT NOT NULL,
-      jobseconds         INTEGER NOT NULL,
-      cumulativeseconds  INTEGER NOT NULL,
-      minutes            INTEGER NOT NULL,
-      cumulativeminutes  INTEGER NOT NULL,
-      filename           TEXT NOT NULL,
-      filesizemb         NUMERIC(10,2) NOT NULL,
-      language           TEXT NOT NULL,
-      requestid          TEXT NOT NULL,
-      processingms       INTEGER NOT NULL,
-      succeeded          BOOLEAN NOT NULL,
-      errormessage       TEXT NOT NULL,
-      model              TEXT NOT NULL,
-      filetype           TEXT NOT NULL
+      id                  BIGSERIAL PRIMARY KEY,
+      timestamputc        TIMESTAMPTZ NOT NULL,
+      timestamplocal      TEXT NOT NULL,
+      email               TEXT NOT NULL,
+      jobseconds          INTEGER NOT NULL,
+      cumulativeseconds   INTEGER NOT NULL,
+      minutes             INTEGER NOT NULL,
+      cumulativeminutes   INTEGER NOT NULL,
+      filename            TEXT NOT NULL,
+      filesizemb          NUMERIC(10,2) NOT NULL,
+      language            TEXT NOT NULL,
+      requestid           TEXT NOT NULL,
+      processingms        INTEGER NOT NULL,
+      succeeded           BOOLEAN NOT NULL,
+      errormessage        TEXT NOT NULL,
+      model               TEXT NOT NULL,
+      filetype            TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_trans_email ON transcriptions(email);
     CREATE INDEX IF NOT EXISTS idx_trans_reqid ON transcriptions(requestid);
@@ -325,8 +324,8 @@ async function addStep(id, text) {
   const step = { at: new Date().toISOString(), text };
   await pool.query(
     `UPDATE jobs
-       SET steps = COALESCE(steps, '[]'::jsonb) || $1::jsonb
-     WHERE requestid = $2`,
+        SET steps = COALESCE(steps, '[]'::jsonb) || $1::jsonb
+      WHERE requestid = $2`,
     [JSON.stringify([step]), id]
   );
   console.log(`[${id}] ${text}`);
@@ -345,9 +344,9 @@ app.get("/status", async (req, res) => {
   if (!id) return res.status(400).json({ error: "Missing id" });
   const { rows } = await pool.query(
     `SELECT requestid, status, steps, error, created_at
-       FROM jobs
-      WHERE requestid = $1
-      LIMIT 1`,
+        FROM jobs
+       WHERE requestid = $1
+       LIMIT 1`,
     [id]
   );
   const j = rows[0];
@@ -543,29 +542,28 @@ async function runBounded(tasks, limit = 3) {
 }
 
 // ---------- OpenAI SDK client (for Responses API) ----------
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); // ← NEW
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ---------- GPT translation (Responses API + fallbacks) ----------
-async function gptTranslateFaithful(originalAll, requestId) {
-  const systemPrompt = `
-You're operating with Transcription Mode A & Transcription Mode B:
-
+async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
+    
+    // --- PROMPT FOR MODE A (All Languages Except Chinese) ---
+    const systemPromptModeA = `
+You're a transcription & translation model operating in Mode A.
 --- Start of Guideline:
 
-Transcription Mode A - Use this mode when the text have less than 5% Chinese Han characters.
-
-Mode A Format
+Transcription Mode A Format
 
 original sentence
-翻譯：[traditional Chinese translation of the original sentence, word by word]
+翻譯：[Translate the sentence while preserving its original meaning and all its components as closely as possible.]
 備註：[footnotes] (do not show this section if not needed)
 insert a blank line before next original sentence.
 original sentence
-翻譯：[traditional Chinese translation of the original sentence, word by word]
+翻譯：[Translate the sentence while preserving its original meaning and all its components as closely as possible.]
 備註：[footnotes] (do not show this section if not needed)
 insert a blank line before next original sentence.
 original sentence
-... and so on ... and so on (make sure to dissect original texts into sentences, and separate every sentence into 1 original sentences formatted as such)
+... and so on ... and so on (make sure to dissect original texts into sentences, and separate sentences into an original sentence formatted as such)
 
 Transcription Mode A rules & guidelines
 
@@ -585,9 +583,33 @@ Hi everyone, my name is Ice Cream David Garcia Truck is Lopez here, and I'm born
 翻譯：大家好，我的名字是冰淇淋大衛·加西亞（David Garcia）卡車洛佩斯（Lopez）在這裡，我在我們去吃冰棒吧的聖費爾南多谷（San Fernando Valley）出生並長大，就在你想要哪一個的第七街附近，旁邊是羅賓森（Robinson）和史泰特兄弟超市（Stater Brothers）多少錢。
 備註：此句內容中可能包含非語意片段或背景雜音。較可能的語意為：大家好，我的名字是大衛·加西亞·洛佩斯（David Garcia Lopez），我在聖費爾南多谷（San Fernando Valley）出生並長大，就在第七街附近，就在羅賓森（Robinson）和史泰特兄弟超市（Stater Brothers）的旁邊。
 
-Transcription Mode B - Use this mode when the text have more than 5% Chinese Han characters
+--- End of Guideline
 
-Mode B Format
+Important things to follow:
+
+- Your Chinese translation must be in fluent Traditional Chinese; act as if your mother tongue is Chinese.
+- Note: Do not use -- dashes because it's too similar to the Chinese character one, instead use ; or other punctuations.
+- Important Note Part A.1:  備註 for Transcription Mode A and Mode B must use professional analysis to operate the best of your diagnosis; 
+- Part A.2: for example, consider dialects, background noice, and flow of the overall pattern from script, etc. to make a smart educated and professional comment that'll help, guide and assist users.
+- Part A.3: any comments must stay helpful, relevent, professional. Avoid making excessive comments; when improper words or phrases are detected, simpley ignore help and move on.
+- Part A.4: Only provide a 備註 if you can offer a clarification that significantly improves the semantic understanding of the sentence, corrects a likely mishearing of a key term, or translates an untranslated foreign phrase. Do not add notes for minor grammatical stumbles that don't obscure the meaning.
+
+- Note: At the top of everything, put my disclaimers first:
+
+免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。請務必自行複核與修訂。本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。
+
+//// 以下是您的中文逐字稿 //// 客服聯係 HELP@VOIXL.COM ///// 感謝您的訂購與支持 /////
+
+- insert 2 lines after disclaimer and start with the transcription.
+`;
+
+    // --- PROMPT FOR MODE B (Chinese Language Only) ---
+    const systemPromptModeB = `
+You're a transcription & translation model operating in Mode B.
+--- Start of Guideline:
+
+Transcription Mode B Format
+
 original sentence
 備註：[footnotes] (do not show this section if not needed)
 insert a blank line before next original sentence.
@@ -605,25 +627,16 @@ Example 3:
 大家好，我的名字好熱哦叫做李允樂，嗯，我的，我的表姐帶我來這裏，嗯來慈濟這裏，我很喜歡這裏的環境, it's very nice, i love it, 大家都很親切，而且今天是我自己開車來的，我喜歡冰淇淋，我已經很久沒開車了哦。
 備註：【李允樂】拼寫存疑，請核對。it's very nice, i love it 譯 【這真不錯，我很喜歡。】此句內容中可能包含非語意片段或背景雜音。較可能的語意為：大家好，我的名字叫做李允樂，我的表姐帶我來慈濟這裏，我很喜歡這裏的環境, 這裏真不錯，我很喜歡, 大家都很親切，而且今天是我自己開車來的，我已經很久沒開車了哦。
 
-
 --- End of Guideline
 
 Important things to follow:
 
-- Transcription mode A: your Chinese translation must be in fluent Traditional Chinese; act as if your mother tongue is Chinese. You're allowed temperature setting range of 0.0 when writing the original sentence, temperature setting between 0.1 to 0.4 when 翻譯 translating original texts into traditioanl Chinese, and temperature setting between 0.1 to 0.5 when assisting users in 備註 footnotes for sentence clarity.
-
-- Transcription mode B: your assisting with Chinese transcription to with 備註 footnotes that'll improve the overall clarity and understanding of the original sentences, if necessary. You're allowed 0.0 temperature setting when writing the original sentence, and allows temperature setting range between 0.0 to 0.5 when assisting in 備註 footnotes.
-
 - If original language is Chinese, make sure characters are in Traditional Chinese when transcribed.
-
 - Note: Do not use -- dashes because it's too similar to the Chinese character one, instead use ; or other punctuations.
-
-- Important Note Part A.1: During 備註 for Transcription Mode A and Mode B, please use professional analysis to do the best of your diagnosis; 
+- Important Note Part A.1:  備註 for Transcription Mode A and Mode B must use professional analysis to operate the best of your diagnosis; 
 - Part A.2: for example, consider dialects, background noice, and flow of the overall pattern from script, etc. to make a smart educated and professional comment that'll help, guide and assist users.
-- Part A.3: any comments must stay helpful, relevent, helpful, professional. Avoid making excessive comments; when improper words or phrases are detected, simpley ignore help and move on.
-- Part A.4: 備註 can only be given to user when the content is more than 80% helpful in correcting missing contents (or excessive contents when there are too much noise); excessive helpfulness is a negative connotation and should not be done.
-
-- defining original sentences as in one complete sentence.
+- Part A.3: any comments must stay helpful, relevent, professional. Avoid making excessive comments; when improper words or phrases are detected, simpley ignore help and move on.
+- Part A.4: Only provide a 備註 if you can offer a clarification that significantly improves the semantic understanding of the sentence, corrects a likely mishearing of a key term, or translates an untranslated foreign phrase. Do not add notes for minor grammatical stumbles that don't obscure the meaning.
 
 - Note: At the top of everything, put my disclaimers first:
 
@@ -634,81 +647,83 @@ Important things to follow:
 - insert 2 lines after disclaimer and start with the transcription.
 `;
 
-  const preferred = process.env.TRANSLATION_MODEL || "gpt-5-mini";
+    // --- LOGIC TO SELECT THE CORRECT PROMPT ---
+    const systemPrompt = mode === 'B' ? systemPromptModeB : systemPromptModeA;
 
-  // Try Responses API first (works with reasoning/thinking models if enabled)
-  try {
-    const resp = await openai.responses.create({
-      model: preferred,
-      input: [
-        { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
-        { role: "user", content: [{ type: "input_text", text: `<source>\n${originalAll || ""}\n</source>` }] },
-      ],
-      // reasoning: { effort: "medium" },
-      // response_format: { type: "text" },
-    });
+    const preferred = process.env.TRANSLATION_MODEL || "gpt-5-mini";
 
-    const out =
-      (resp.output_text && resp.output_text.trim()) ||
-      (Array.isArray(resp.output)
-        ? resp.output
-            .flatMap(o => (o?.content || []))
-            .map(c => (typeof c?.text === "string" ? c.text : ""))
-            .join("")
-            .trim()
-        : "");
-
-    if (out) return out;
-
-    await addStep(requestId, `Responses output empty from ${preferred}; falling back.`);
-  } catch (e) {
-    const msg = e?.response?.data?.error?.message || e?.message || String(e);
-    await addStep(requestId, `Responses API failed (${preferred}): ${msg}; falling back.`);
-  }
-
-  // Fallback to Chat Completions (stable, widely available)
-  const chatCandidates = ["gpt-4.1-mini", "gpt-4o-mini"];
-  const messages = [
-    { role: "system", content: systemPrompt },
-    { role: "user",   content: `<source>\n${originalAll || ""}\n</source>` },
-  ];
-
-  for (const model of chatCandidates) {
+    // Try Responses API first (works with reasoning/thinking models if enabled)
     try {
-      const r = await axiosOpenAI.post(
-        "https://api.openai.com/v1/chat/completions",
-        { model, temperature: 0, messages, response_format: { type: "text" } },
-        {
-          headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-          validateStatus: () => true,
-        }
-      );
-      if (r.status >= 200 && r.status < 300) {
-        const out = r.data?.choices?.[0]?.message?.content?.trim();
-        if (out) {
-          if (model !== preferred) await addStep(requestId, `Used fallback chat model: ${model}`);
-          return out;
-        }
-        await addStep(requestId, `Chat output empty from ${model}; trying next.`);
-      } else {
-        await addStep(
-          requestId,
-          `Chat API error (${model}): ${r.data?.error?.message || `HTTP ${r.status}`}`
-        );
-      }
-    } catch (e) {
-      await addStep(requestId, `Chat API exception (${model}): ${e?.message || e}`);
-    }
-  }
+        const resp = await openai.responses.create({
+            model: preferred,
+            input: [
+                { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+                { role: "user", content: [{ type: "input_text", text: `<source>\n${originalAll || ""}\n</source>` }] },
+            ],
+        });
 
-  // Last resort: never return blank
-  return "【翻譯暫不可用：已附上原文】\n\n" + (originalAll || "");
+        const out =
+            (resp.output_text && resp.output_text.trim()) ||
+            (Array.isArray(resp.output)
+                ? resp.output
+                    .flatMap(o => (o?.content || []))
+                    .map(c => (typeof c?.text === "string" ? c.text : ""))
+                    .join("")
+                    .trim()
+                : "");
+
+        if (out) return out;
+
+        await addStep(requestId, `Responses output empty from ${preferred}; falling back.`);
+    } catch (e) {
+        const msg = e?.response?.data?.error?.message || e?.message || String(e);
+        await addStep(requestId, `Responses API failed (${preferred}): ${msg}; falling back.`);
+    }
+
+    // Fallback to Chat Completions (stable, widely available)
+    const chatCandidates = ["gpt-4.1-mini", "gpt-4o-mini"];
+    const messages = [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: `<source>\n${originalAll || ""}\n</source>` },
+    ];
+
+    for (const model of chatCandidates) {
+        try {
+            const r = await axiosOpenAI.post(
+                "https://api.openai.com/v1/chat/completions",
+                { model, temperature: 0, messages, response_format: { type: "text" } },
+                {
+                    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+                    validateStatus: () => true,
+                }
+            );
+            if (r.status >= 200 && r.status < 300) {
+                const out = r.data?.choices?.[0]?.message?.content?.trim();
+                if (out) {
+                    if (model !== preferred) await addStep(requestId, `Used fallback chat model: ${model}`);
+                    return out;
+                }
+                await addStep(requestId, `Chat output empty from ${model}; trying next.`);
+            } else {
+                await addStep(
+                    requestId,
+                    `Chat API error (${model}): ${r.data?.error?.message || `HTTP ${r.status}`}`
+                );
+            }
+        } catch (e) {
+            await addStep(requestId, `Chat API exception (${model}): ${e?.message || e}`);
+        }
+    }
+
+    // Last resort: never return blank
+    return "【翻譯暫不可用：已附上原文】\n\n" + (originalAll || "");
 }
+
 
 // ---------- main processor ----------
 async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }) {
   await setJobStatus(requestId, "processing");
-  await updateStatus(requestId, "processing"); // CHANGED: requestId
+  await updateStatus(requestId, "processing");
 
   addStep(
     requestId,
@@ -813,17 +828,30 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
       originalAll += (originalAll ? "\n\n" : "") + (verbose?.text || "");
     }
 
+    // --- START: MODE SELECTION LOGIC ---
+    let translationMode = "A";
+    // Whisper uses 'zh' for Chinese. startsWith() is robust for variants like 'zh-TW'.
+    if (language && language.startsWith('zh')) {
+        translationMode = "B";
+        addStep(requestId, "Detected Chinese language. Using Mode B for translation.");
+    } else {
+        addStep(requestId, `Detected language: ${language || 'unknown'}. Using Mode A for translation.`);
+    }
+    // --- END: MODE SELECTION LOGIC ---
+
     // zh-TW faithful translation
-    addStep(requestId, "Calling GPT 原文→繁中 (faithful, multilingual) …");
+    addStep(requestId, "Calling GPT for translation…");
     let zhTraditional = "";
     try {
-      const inputForGpt = originalAll || "";
-      zhTraditional = await gptTranslateFaithful(inputForGpt, requestId);
-      addStep(requestId, "繁中 done.");
-    } catch (_) {
-      addStep(requestId, "⚠️ GPT translation failed — sending original only.");
-      zhTraditional = "";
+        const inputForGpt = originalAll || "";
+        // Pass the determined mode to the translation function
+        zhTraditional = await gptTranslateFaithful(inputForGpt, requestId, translationMode);
+        addStep(requestId, "繁中 done.");
+    } catch (e) {
+        addStep(requestId, "⚠️ GPT translation failed — sending original only. Error: " + (e?.message || e));
+        zhTraditional = "";
     }
+
 
     // email with attachments
     const localStamp = fmtLocalStamp(new Date());
@@ -939,7 +967,7 @@ ${originalAll}
       language: language || "",
       finished_at: new Date().toISOString(),
     });
-    await updateStatus(requestId, "succeeded", jobSeconds); // CHANGED: requestId
+    await updateStatus(requestId, "succeeded", jobSeconds);
     await setJobStatus(requestId, "done");
     addStep(requestId, "✅ Done");
   } catch (err) {
@@ -960,7 +988,7 @@ ${originalAll}
       finished_at: new Date().toISOString(),
       error: eMsg,
     });
-    await updateStatus(requestId, "processing_fail"); // CHANGED: requestId
+    await updateStatus(requestId, "processing_fail");
   } finally {
     addStep(requestId, "Cleaning up temporary files...");
     for (const f of Array.from(tempFiles)) {
@@ -1024,7 +1052,7 @@ app.post(
         console.error(`[${requestId}] Background crash:`, e?.message || e);
         try {
           await setJobStatus(requestId, "error", e?.message || String(e));
-          await updateStatus(requestId, "processing_fail"); // CHANGED: requestId
+          await updateStatus(requestId, "processing_fail");
         } catch {}
       }
     });
@@ -1045,9 +1073,9 @@ app.post("/admin/trim-jobs", async (req, res) => {
     const r1 = await pool.query(
       `
       UPDATE jobs
-         SET steps = '[]'::jsonb
-       WHERE status IN ('done','error')
-         AND created_at < now() - ($1 || ' days')::interval
+           SET steps = '[]'::jsonb
+         WHERE status IN ('done','error')
+           AND created_at < now() - ($1 || ' days')::interval
       `,
       [String(TRIM_JOBS_EMPTY_DAYS)]
     );
@@ -1055,7 +1083,7 @@ app.post("/admin/trim-jobs", async (req, res) => {
     const r2 = await pool.query(
       `
       DELETE FROM jobs
-       WHERE created_at < now() - ($1 || ' days')::interval
+        WHERE created_at < now() - ($1 || ' days')::interval
       `,
       [String(PURGE_JOBS_DAYS)]
     );
@@ -1083,6 +1111,6 @@ app.get("/", (_req, res) =>
 const port = process.env.PORT || 3000;
 // <<< FIX: capture server and relax default Node timeouts
 const server = app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
-server.requestTimeout = 0;       // no overall per-request timeout
-server.headersTimeout = 0;       // allow slow clients to send headers
+server.requestTimeout = 0;        // no overall per-request timeout
+server.headersTimeout = 0;        // allow slow clients to send headers
 server.keepAliveTimeout = 60_000;
