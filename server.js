@@ -291,6 +291,41 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// ---------- language helpers (Fix 1) ----------
+function isChineseLang(code) {
+  const c = (code || '').toLowerCase().trim();
+  const sinitic = [
+    'zh', 'zh-cn', 'zh-tw', 'zh-hk', // Chinese
+    'cmn', 'yue', 'wuu', 'gan', 'hak', 'nan' // Mandarin, Cantonese, Wu, Gan, Hakka, Minnan
+  ];
+  return sinitic.some(p => c === p || c.startsWith(p));
+}
+function cjkRatio(text) {
+  if (!text) return 0;
+  const cjk = text.match(/[\u3400-\u4DBF\u4E00-\u9FFF]/g) || []; // CJK Ext-A + Unified
+  return cjk.length / text.length;
+}
+function decideChinese(langs, text) {
+  const counts = {};
+  for (const l of langs) {
+    const k = (l || '').toLowerCase();
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  let topLang = '';
+  let topCount = -1;
+  for (const [k, v] of Object.entries(counts)) {
+    if (v > topCount) { topCount = v; topLang = k; }
+  }
+  if (isChineseLang(topLang)) {
+    return { isChinese: true, finalLang: topLang, reason: `majority language "${topLang}"` };
+  }
+  const ratio = cjkRatio(text);
+  if (ratio > 0.20) {
+    return { isChinese: true, finalLang: topLang || 'zh', reason: `CJK ratio ${(ratio*100).toFixed(1)}%` };
+  }
+  return { isChinese: false, finalLang: topLang || '', reason: topLang ? `majority language "${topLang}"` : 'no language reported' };
+}
+
 // ---------- keep-alive axios for OpenAI (reduces "socket hang up") ----------
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
@@ -448,7 +483,7 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
 }
 
 // ---------- OpenAI (Whisper) ----------
-async function openaiTranscribeVerbose(audioPath, requestId) {
+async function openaiTranscribeVerbose(audioPath, requestId, langHint) { // Fix 2 signature
   // === CHANGE START: AbortController per-call timeout (industry standard) ===
   const PER_CALL_MS = Number(process.env.WHISPER_CALL_TIMEOUT_MS || 360_000); // 6 minutes
   const controller = new AbortController();
@@ -463,6 +498,7 @@ async function openaiTranscribeVerbose(audioPath, requestId) {
     fd.append("model", "whisper-1");
     fd.append("response_format", "verbose_json");
     fd.append("temperature", "0");
+    if (langHint) fd.append("language", String(langHint)); // Fix 2: language hint
 
     const r = await axiosOpenAI.post(
       "https://api.openai.com/v1/audio/transcriptions",
@@ -554,29 +590,27 @@ You're a transcription & translation model operating in Mode A.
 
 Transcription Mode A Format
 
-original sentence
+[one completely & original sentence per line]
 翻譯：[Translate the sentence while preserving its original meaning and all its components as closely as possible.]
 備註：[footnotes] (do not show this section if not needed)
 insert a blank line before next original sentence.
-original sentence
+[the second completele & original sentence]
 翻譯：[Translate the sentence while preserving its original meaning and all its components as closely as possible.]
 備註：[footnotes] (do not show this section if not needed)
 insert a blank line before next original sentence.
-original sentence
 ... and so on ... and so on (make sure to dissect original texts into sentences, and separate sentences into an original sentence formatted as such)
 
 Transcription Mode A rules & guidelines
 
-1) original sentence must be 100% matching with the speaker. no removal of repeated words, no fixing, no hallucination, no editing or assumptions.
-2) translations must translate everything into Chinese, with parentheses followed immediately for proper nouns like names, brands, or culturally specific places that lack direct English equivalents; do not need parentheses for common nouns or universally understood terms. See example 1.
+1) When formatting original sentences, it must be 100% matching with the original text. no removal of repeated words, no fixing of anything, no hallucination or omission, no editing, fixing or assumptions.
+2) Translation must translate everything into Traditional Chinese, with parentheses followed immediately for proper nouns like names, brands, or culturally specific places that lack direct English equivalents; do not need parentheses for common nouns or universally understood terms. See example 1.
 
 Example 1:
 Hi everyone, my name is David Garcia Lopez, and I'm born and raised in the San Fernando Valley, just down at 7th street, next to Robinson and Stater Brothers.
 翻譯：大家好，我的名字是大衛·加西亞·洛佩斯（David Garcia Lopez），我在聖費爾南多谷（San Fernando Valley）出生並長大，就在第七街附近，旁邊是羅賓森（Robinson）和史泰特兄弟超市（Stater Brothers）。
 
-3) Important 備註 footnotes will appear when there are circumstances such as uncertainty in words or phrases that needs smart assistance and clarifications. See example 2.
-4) If and when 備註 footnotes are needed, still 翻譯 with 0.0 temperature first, without removing or fixing anything. 
-5) Next, provide smart interpretations and implement fix suggestions and/or clarifications in 翻譯 footnotes with temperature setting between 0.0 to 0.5; See example 2.
+3) 備註 footnotes should appear when there are high uncertainties of words or phrases and needs GPT assistance and clarifications. See example 2.
+4) If and when 備註 footnotes are needed, make the literal translation first in 翻譯 aand GPT assisted clarifications in 備註. See example 2.
 
 Example 2:
 Hi everyone, my name is Ice Cream David Garcia Truck is Lopez here, and I'm born and raised in let's get popsicles, the San Fernando Valley, just down which one do you want, at 7th street, next to Robinson and Stater how much is it Brothers.
@@ -589,10 +623,10 @@ Important things to follow:
 
 - Your Chinese translation must be in fluent Traditional Chinese; act as if your mother tongue is Chinese.
 - Note: Do not use -- dashes because it's too similar to the Chinese character one, instead use ; or other punctuations.
-- Important Note Part A.1:  備註 for Transcription Mode A and Mode B must use professional analysis to operate the best of your diagnosis; 
-- Part A.2: for example, consider dialects, background noice, and flow of the overall pattern from script, etc. to make a smart educated and professional comment that'll help, guide and assist users.
-- Part A.3: any comments must stay helpful, relevent, professional. Avoid making excessive comments; when improper words or phrases are detected, simpley ignore help and move on.
-- Part A.4: Only provide a 備註 if you can offer a clarification that significantly improves the semantic understanding of the sentence, corrects a likely mishearing of a key term, or translates an untranslated foreign phrase. Do not add notes for minor grammatical stumbles that don't obscure the meaning.
+- Important Note Part A.1:  備註 must use professional analysis to create the best of your diagnosis; 
+- Part A.2: for example, consider dialects, background noise, and flow of the overall script patterns, etc. to make a smart & educated & professional comment that'll help, guide, and assist users.
+- Part A.3: any 備註 must stay helpful, relevent, professional. Avoid making excessive 備註; when improper words or phrases are detected, simpley ignore help and move on.
+- Part A.4: Only provide 備註 if you can offer a clarification that significantly improves the semantic understanding of the sentence, corrects a likely mishearing of a key term, or translates an untranslated foreign phrase. Do not add 備註 for minor grammatical stumbles that don't obscure the meaning.
 
 - Note: At the top of everything, put my disclaimers first:
 
@@ -608,19 +642,19 @@ Important things to follow:
 You're a transcription & translation model operating in Mode B.
 --- Start of Guideline:
 
-Transcription Mode B Format
+Transcription Mode B Sentence Format
 
-original sentence
+[one completely & original sentence per line]
 備註：[footnotes] (do not show this section if not needed)
 insert a blank line before next original sentence.
-original sentence
+[the second completele & original sentence]
 備註：[footnotes] (do not show this section if not needed)
 insert a blank line before next original sentence.
-... and so on ... and so on (make sure to dissect original texts into sentences, and separate every sentence into 1 original sentences formatted as such).
+... and so on ... and so on (to get original sentences, dissect original paragraphs into sentences, and separate every sentence into 1 original sentences formatted as such).
 
 Transcription Mode B rules & guidelines
-1) original sentence must be 100% matching with the speaker. no removal of repeated words, no fixing, no hallucination, no editing or assumptions.
-2）備註 footnotes will only appear under these circumstances: when there are non-chinese words that needs translation, or also when there are uncertainty in words or phrases that needs assistance with clarifications. See example 3.
+1) When formatting original sentences, it must be 100% matching with the original text. no removal of repeated words, no fixing of anything, no hallucination or omission, no editing, fixing or assumptions.
+2）備註 footnotes should only appear under when there are 1. non-chinese words that needs translation (for example, bilingual speakers mixing Chinese with something else), or 2. when there are high uncertainties in words or phrases that needed clarification assistances. See example 3.
 
 Example 3:
 
@@ -633,10 +667,10 @@ Important things to follow:
 
 - If original language is Chinese, make sure characters are in Traditional Chinese when transcribed.
 - Note: Do not use -- dashes because it's too similar to the Chinese character one, instead use ; or other punctuations.
-- Important Note Part A.1:  備註 for Transcription Mode A and Mode B must use professional analysis to operate the best of your diagnosis; 
-- Part A.2: for example, consider dialects, background noice, and flow of the overall pattern from script, etc. to make a smart educated and professional comment that'll help, guide and assist users.
-- Part A.3: any comments must stay helpful, relevent, professional. Avoid making excessive comments; when improper words or phrases are detected, simpley ignore help and move on.
-- Part A.4: Only provide a 備註 if you can offer a clarification that significantly improves the semantic understanding of the sentence, corrects a likely mishearing of a key term, or translates an untranslated foreign phrase. Do not add notes for minor grammatical stumbles that don't obscure the meaning.
+- Important Note Part A.1:  備註 must use professional analysis to create the best of your diagnosis; 
+- Part A.2: for example, consider dialects, background noise, and flow of the overall script patterns, etc. to make a smart & educated & professional comment that'll help, guide, and assist users.
+- Part A.3: any 備註 must stay helpful, relevent, professional. Avoid making excessive 備註; when improper words or phrases are detected, simpley ignore help and move on.
+- Part A.4: Only provide 備註 if you can offer a clarification that significantly improves the semantic understanding of the sentence, corrects a likely mishearing of a key term, or translates an untranslated foreign phrase. Do not add 備註 for minor grammatical stumbles that don't obscure the meaning.
 
 - Note: At the top of everything, put my disclaimers first:
 
@@ -721,7 +755,7 @@ Important things to follow:
 
 
 // ---------- main processor ----------
-async function processJob({ email, inputPath, fileMeta, requestId, jobId, token }) {
+async function processJob({ email, inputPath, fileMeta, requestId, jobId, token, forceLang = '', forceMode = '' }) { // Fix 3: new params
   await setJobStatus(requestId, "processing");
   await updateStatus(requestId, "processing");
 
@@ -814,7 +848,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     const tasks = parts.map((filePath, idx) => async () => {
       addStep(requestId, `Part ${idx + 1}/${parts.length} → start`);
       const res = await withRetries(
-        () => openaiTranscribeVerbose(filePath, requestId),
+        () => openaiTranscribeVerbose(filePath, requestId, forceLang || null), // Fix 2: pass lang hint
         { maxAttempts: 5, baseDelayMs: 700 }
       );
       addStep(requestId, `Part ${idx + 1}/${parts.length} → done`);
@@ -823,21 +857,36 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
     const results = await runBounded(tasks, concurrency);
 
     let originalAll = "";
+    const detectedLangs = [];
     for (const verbose of results) {
-      if (!language && verbose?.language) language = verbose.language;
+      if (verbose?.language) detectedLangs.push(verbose.language);
       originalAll += (originalAll ? "\n\n" : "") + (verbose?.text || "");
     }
-
-    // --- START: MODE SELECTION LOGIC ---
-    let translationMode = "A";
-    // Whisper uses 'zh' for Chinese. startsWith() is robust for variants like 'zh-TW'.
-    if (language && language.startsWith('zh')) {
-        translationMode = "B";
-        addStep(requestId, "Detected Chinese language. Using Mode B for translation.");
-    } else {
-        addStep(requestId, `Detected language: ${language || 'unknown'}. Using Mode A for translation.`);
+    if (forceLang) {
+      language = forceLang;
+      addStep(requestId, `force_lang applied: "${forceLang}"`);
+    } else if (!language && detectedLangs.length) {
+      const tally = {};
+      for (const l of detectedLangs) tally[l] = (tally[l] || 0) + 1;
+      language = Object.entries(tally).sort((a,b)=>b[1]-a[1])[0][0];
     }
-    // --- END: MODE SELECTION LOGIC ---
+
+    // --- START: ROBUST MODE SELECTION LOGIC (Fix 4) ---
+    let translationMode = 'A';
+    if (forceMode === 'A' || forceMode === 'B') {
+      translationMode = forceMode;
+      addStep(requestId, `force_mode applied: ${translationMode}`);
+    } else {
+      const decision = decideChinese(detectedLangs, originalAll);
+      translationMode = decision.isChinese ? 'B' : 'A';
+      if (!language || decision.finalLang) language = decision.finalLang || language;
+      addStep(
+        requestId,
+        `Mode decision: langs=${JSON.stringify(detectedLangs)}; reason=${decision.reason}; ` +
+        `→ ${translationMode === 'B' ? 'Mode B (Chinese)' : 'Mode A (non-Chinese)'}`
+      );
+    }
+    // --- END: ROBUST MODE SELECTION LOGIC (Fix 4) ---
 
     // zh-TW faithful translation
     addStep(requestId, "Calling GPT for translation…");
@@ -852,10 +901,15 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token 
         zhTraditional = "";
     }
 
-
-    // email with attachments
+    // email with attachments (Fix 5)
     const localStamp = fmtLocalStamp(new Date());
-    const attachmentText = `＝＝ 中文（繁體） ＝＝
+    const emailSubject = translationMode === 'B'
+      ? '您的中文逐字稿（原文＋備註）'
+      : '您的逐字稿（原文＋繁體中文翻譯）';
+    const headerZh = translationMode === 'B'
+      ? '＝＝ 中文逐字稿（繁體） ＝＝'
+      : '＝＝ 中文（繁體） ＝＝';
+    const attachmentText = `${headerZh}
 ${zhTraditional}
 
 ＝＝ 原文 ＝＝
@@ -869,7 +923,7 @@ ${originalAll}
       sections: [
         {
           children: [
-            new Paragraph("＝＝ 中文（繁體） ＝＝"),
+            new Paragraph(headerZh),
             ...String(zhTraditional || "")
               .split("\n")
               .map((line) => new Paragraph(line)),
@@ -889,7 +943,7 @@ ${originalAll}
       from: `${FROM_NAME} <${FROM_EMAIL}>`,
       to: email,
       replyTo: FROM_EMAIL,
-      subject: "您的逐字稿（原文與繁體中文）",
+      subject: emailSubject, // Fix 5
       text: `轉寫已完成 ${localStamp}
 
 本次上傳時長（秒）：${jobSeconds}
@@ -1040,6 +1094,11 @@ app.post(
             dbErr?.message || dbErr
           );
         }
+
+        // Fix 3: read QA overrides
+        const force_lang = (req.body?.force_lang || '').toString().trim();
+        const force_mode = (req.body?.force_mode || '').toString().trim().toUpperCase();
+
         await processJob({
           email,
           inputPath: req.file.path,
@@ -1047,6 +1106,8 @@ app.post(
           requestId,
           jobId: String(req.body?.job_id || ""),
           token: String(req.body?.token || ""),
+          forceLang: force_lang || '',
+          forceMode: (force_mode === 'A' || force_mode === 'B') ? force_mode : ''
         });
       } catch (e) {
         console.error(`[${requestId}] Background crash:`, e?.message || e);
