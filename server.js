@@ -622,6 +622,8 @@ Important things to follow:
 - Part A.2: for example, consider dialects, background noice, and flow of the overall pattern from script, etc. to make a smart educated and professional comment that'll help, guide and assist users.
 - Part A.3: any helpful comments must stay relevent, helpful, and professional. Avoid using improper words and phrases; if improper words or phrases are detected, simpley ignore help and move on.
 
+- When separating original sentences, avoid 1 or 2 words per line. Make it a required minimum of at least 5 words per original sentence line. 
+
 - Note: At the top of everything, put my disclaimers first:
 
 免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。請務必自行複核與修訂。本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。
