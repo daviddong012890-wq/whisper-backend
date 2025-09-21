@@ -112,7 +112,7 @@ app.use(
 app.options("*", cors());
 app.use(express.json({ limit: "1mb" }));
 
-// <<< FIX: keep long uploads alive (disable per-request timeouts)
+// keep long uploads alive
 app.use((req, _res, next) => {
   try { req.setTimeout?.(0); } catch {}
   try {
@@ -291,43 +291,58 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ---------- language helpers (Fix 1 + updates) ----------
-function isMandarinLang(code) {
-  const c = (code || "").toLowerCase().trim();
-  const mandarin = [
-    "zh", "zh-cn", "zh-tw", "zh-hk", "zh-hans", "zh-hant", "cmn"
-  ];
-  return mandarin.some(p => c === p || c.startsWith(p));
-}
-function isChineseDialectLang(code) {
-  const c = (code || "").toLowerCase().trim();
-  const dialects = ["yue", "wuu", "gan", "hak", "nan", "hsn", "cdo", "mnp"]; // Cantonese, Wu/Shanghai, Gan, Hakka, Minnan/Taiwanese, Xiang, Min Dong, Northern Min
-  return dialects.some(p => c === p || c.startsWith(p));
+// ---------- language helpers (Fix 1 + block classifiers) ----------
+function isChineseLang(code) {
+  const c = (code || '').toLowerCase().trim();
+  const sinitic = ['zh','zh-cn','zh-tw','zh-hk','cmn','yue','wuu','gan','hak','nan'];
+  return sinitic.some(p => c === p || c.startsWith(p));
 }
 function cjkRatio(text) {
   if (!text) return 0;
   const cjk = text.match(/[\u3400-\u4DBF\u4E00-\u9FFF]/g) || [];
   return cjk.length / text.length;
 }
-function decideModeAorB(langs, text) {
-  const low = (langs || []).map(l => (l || "").toLowerCase());
-  // Prefer explicit dialect → Mode A
-  const dialectHit = low.find(isChineseDialectLang);
-  if (dialectHit) return { mode: "A", finalLang: dialectHit, reason: `Chinese dialect "${dialectHit}"` };
-
-  // Explicit Mandarin → Mode B
-  const mandarinHit = low.find(isMandarinLang);
-  if (mandarinHit) return { mode: "B", finalLang: mandarinHit, reason: `Mandarin "${mandarinHit}"` };
-
-  // High CJK ratio but no explicit Mandarin code → treat as unknown CJK → Mode A
+const reHira = /[\u3040-\u309F]/;
+const reKata = /[\u30A0-\u30FF]/;
+const reHangul = /[\uAC00-\uD7AF]/;
+function classifyScript(text){
+  if (!text) return 'other';
+  if (reHira.test(text) || reKata.test(text)) return 'ja';
+  if (reHangul.test(text)) return 'ko';
+  if (cjkRatio(text) > 0.2) return 'zh';
+  return 'other';
+}
+// quick & dirty Mandarin-likeliness via very common function words
+const commonZh = new Set('的一是不在人有了和就要也到說為在你我他了沒這個吧嗎來去很可以對沒有把會讓跟還呢把像可是因為如果但是所以以及或者而且並且以及與於再又都把更最把給被從等與把等'.split(''));
+function mandarinScore(text){
+  const chars = (text || '').split('').filter(ch => /[\u4E00-\u9FFF]/.test(ch));
+  if (!chars.length) return 0;
+  let hits = 0;
+  for (const ch of chars) if (commonZh.has(ch)) hits++;
+  return hits / chars.length; // ~0.18–0.35 typical for natural Mandarin; <<0.12 often dialect/jibberish
+}
+function decideChinese(langs, text) {
+  const counts = {};
+  for (const l of langs) {
+    const k = (l || '').toLowerCase();
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  let topLang = '';
+  let topCount = -1;
+  for (const [k, v] of Object.entries(counts)) {
+    if (v > topCount) { topCount = v; topLang = k; }
+  }
+  if (isChineseLang(topLang)) {
+    return { isChinese: true, finalLang: topLang, reason: `majority language "${topLang}"` };
+  }
   const ratio = cjkRatio(text);
-  if (ratio > 0.2) return { mode: "A", finalLang: "", reason: `CJK ratio ${(ratio*100).toFixed(1)}% (unknown CJK)` };
-
-  // Default for everything else → Mode A
-  return { mode: "A", finalLang: low[0] || "", reason: low[0] ? `majority "${low[0]}"` : "no language reported" };
+  if (ratio > 0.20) {
+    return { isChinese: true, finalLang: topLang || 'zh', reason: `CJK ratio ${(ratio*100).toFixed(1)}%` };
+  }
+  return { isChinese: false, finalLang: topLang || '', reason: topLang ? `majority language "${topLang}"` : 'no language reported' };
 }
 
-// ---------- keep-alive axios for OpenAI (reduces "socket hang up") ----------
+// ---------- keep-alive axios for OpenAI ----------
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 
@@ -343,7 +358,7 @@ const axiosOpenAI = axios.create({
   },
 });
 
-// ---------- DB helpers (Postgres) ----------
+// ---------- DB helpers ----------
 async function createJob(id) {
   const step = { at: new Date().toISOString(), text: "Job accepted by server." };
   await pool.query(
@@ -414,9 +429,6 @@ function ffprobeDurationSeconds(filePath) {
 function estimateSizeBytes(seconds, kbps) {
   return Math.ceil(seconds * (kbps * 1000) / 8);
 }
-
-// Adaptive speech-first strategy: try 80k if it fits, else 64k, else 48k.
-// "needsSplit" means the whole clip won't fit target at the chosen bitrate.
 function chooseBitrateAndSplit(seconds) {
   const options = [80, 64, 48];
   for (const kb of options) {
@@ -425,11 +437,9 @@ function chooseBitrateAndSplit(seconds) {
       return { kbps: kb, needsSplit: false, estBytes: est };
     }
   }
-  // If none fit as a single file, pick the lowest (48) and segment.
   const kbps = options[options.length - 1];
   return { kbps, needsSplit: true, estBytes: estimateSizeBytes(seconds, kbps) };
 }
-
 function computeSegmentSeconds(kbps) {
   const seconds = Math.floor(TARGET_MAX_BYTES / ((kbps * 1000) / 8));
   return Math.max(MIN_SEG_SECONDS, Math.min(MAX_SEG_SECONDS, seconds || DEFAULT_SEG_SECONDS));
@@ -441,7 +451,7 @@ async function encodeSingleMp3(inPath, outMp3, kbps, requestId) {
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
-      .audioFilters(["dynaudnorm"]) // speech-safe normalization only
+      .audioFilters(["dynaudnorm"])
       .outputOptions([
         "-ac", "1",
         "-ar", "16000",
@@ -459,7 +469,7 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
-      .audioFilters(["dynaudnorm"]) // speech-safe normalization only
+      .audioFilters(["dynaudnorm"])
       .outputOptions([
         "-ac", "1",
         "-ar", "16000",
@@ -484,12 +494,10 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
 }
 
 // ---------- OpenAI (Whisper) ----------
-async function openaiTranscribeVerbose(audioPath, requestId, langHint) { // Fix 2 signature
-  // === CHANGE START: AbortController per-call timeout (industry standard) ===
-  const PER_CALL_MS = Number(process.env.WHISPER_CALL_TIMEOUT_MS || 360_000); // 6 minutes
+async function openaiTranscribeVerbose(audioPath, requestId, langHint) {
+  const PER_CALL_MS = Number(process.env.WHISPER_CALL_TIMEOUT_MS || 360_000);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PER_CALL_MS);
-  // === CHANGE END ===
 
   try {
     const fd = new FormData();
@@ -499,16 +507,16 @@ async function openaiTranscribeVerbose(audioPath, requestId, langHint) { // Fix 
     fd.append("model", "whisper-1");
     fd.append("response_format", "verbose_json");
     fd.append("temperature", "0");
-    if (langHint) fd.append("language", String(langHint)); // Fix 2: language hint
+    // ask for segment timing explicitly (some runtimes require this)
+    fd.append("timestamp_granularities[]", "segment");
+    if (langHint) fd.append("language", String(langHint));
 
     const r = await axiosOpenAI.post(
       "https://api.openai.com/v1/audio/transcriptions",
       fd,
       {
-        // === CHANGE START: make call abortable & throw on non-2xx ===
         signal: controller.signal,
         validateStatus: (s) => s >= 200 && s < 300,
-        // === CHANGE END ===
         headers: {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
           ...fd.getHeaders(),
@@ -527,7 +535,7 @@ async function openaiTranscribeVerbose(audioPath, requestId, langHint) { // Fix 
     );
     throw err;
   } finally {
-    clearTimeout(timer); // === CHANGE: always clear timer
+    clearTimeout(timer);
   }
 }
 
@@ -549,7 +557,7 @@ async function withRetries(fn, { maxAttempts = 5, baseDelayMs = 700 } = {}) {
         code === "ECONNRESET" ||
         code === "ETIMEDOUT" ||
         code === "ECONNABORTED" ||
-        code === "ERR_CANCELED"; // ← CHANGE: retry on AbortController abort
+        code === "ERR_CANCELED";
 
       if (!retriable || attempt >= maxAttempts) throw e;
 
@@ -578,164 +586,152 @@ async function runBounded(tasks, limit = 3) {
   });
 }
 
-// ---------- OpenAI SDK client (for Responses API) ----------
+// ---------- OpenAI SDK client (Responses API) ----------
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ---------- GPT translation (Responses API + fallbacks) ----------
-async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
-    
-    // --- PROMPT FOR MODE A (All Languages Except Mandarin Chinese) ---
-    const systemPromptModeA = `
+async function gptTranslateFaithful(originalAll, requestId, mode = 'A', emitHeader = true) {
+
+  // === Prompts updated: no 【? ?】 anywhere; no em-dashes; no square-bracket wrappers ===
+  const systemPromptModeA = `
 You are a transcription & translation model operating in Mode A.
-Use this for ANY source that is NOT Modern Standard Chinese (Mandarin).
-Includes English, Spanish, French, German, Vietnamese, Japanese, Italian, Czech, etc.,
-and Chinese dialects (Cantonese, Hokkien, Hakka, Shanghainese/Wu, Taiwanese, etc.) even if written with Han characters.
+Use this for ANY source that is NOT Modern Standard Chinese (Mandarin). Includes Chinese dialects (Cantonese, Shanghainese/Wu, Hokkien/Minnan, Hakka, Taiwanese), even if Han characters appear.
 
-=== OUTPUT HEADER (print once at the top) ===
-免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質等因素而不完全準確；請務必自行複核與修訂。本服務對因錯誤所致任何損失概不負責。
-（說明：括號（）與方括號[] 內的中文說明為系統為協助理解所加入，非原文內容。切勿使用破折號—或——；請改用逗號、分號等標點。）
+=== OUTPUT HEADER (print once only if PRINT_HEADER=YES) ===
+免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質等因素而不完全準確；請務必自行複核與修訂。本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。
+（說明：括號（）與方括號[] 內之內容若出現，皆為系統為協助理解所加入，非原文內容。Mode A 的「翻譯」行可於專名或外語詞後加中文釋義；以利核對。禁止使用破折號—或——，請改用；或、。）
 
-//// 以下是您的中文逐字稿 //// 客服聯繫 HELP@VOIXL.COM ///// 感謝您的訂購與支持 ////
+=== FORMAT per sentence/unit ===
+<ORIGINAL line exactly as ASR produced; do NOT wrap it in any brackets.>
 
-（在上述標頭後留兩個空行再開始輸出）
+(blank line)
 
-=== FORMAT（每句／自然語意單位重複以下結構）===
-[ORIGINAL sentence — ASR 原文逐字，不得改寫、刪除或插入任何符號；不要使用【?…?】之類標記。]
+翻譯：以繁體中文逐字直譯，完整保留資訊與不確定性；遇外語詞必翻譯為中文，並於詞後以（原文）或（中文釋義）輔助核對；不使用破折號。
+（若原句含有真正的 [雜音]/[重疊]/[音樂]/[笑聲] 標記，僅當其影響準確性時在備註說明；不要另行添加方括號。）
 
-(leave ONE blank line)
+（可選）備註：精簡且有用的說明（如：數字/人名存疑、日期格式含糊等）。不要加指令語氣。
 
-翻譯：[把 ORIGINAL 逐字直譯成繁體中文；不得使用破折號—或——；必要時在專名或外語詞後加（原文外語）或（中文釋義）。]
-
-[OPTIONAL — 只有有價值才加]
-備註：[簡短客觀；例如：日期格式含糊（MM/DD 或 DD/MM）；數字發音不清，建議核對；人名/地名寫法存疑；有[重疊]/[雜音]/[音樂]/[笑聲]/[掌聲]且可能影響正確性等。不要重述無用事實。]
-
-[OPTIONAL — 僅在噪音極多且影響閱讀時提供]
-清整版：[更易讀的中文版本；中立、克制；非法律或事實依據。]
-
-(leave ONE blank line, then continue)
+(blank line)
 
 === CORE RULES ===
-1) ORIGINAL 必須與 ASR 一致；不新增任何【?…?】或其他符號。
-2) 翻譯為繁中；保留不確定資訊；括號內容為系統輔助，必為中文或「原文外語」對照。
-3) 切勿使用破折號—或——。
-4) 僅在關鍵資訊受影響時於翻譯中保留方括號標記（如 73[聽不清]9）；一般噪音只寫在備註。
-5) 多語混用：優先在翻譯行就地用括號說清；若外語處太多導致難讀，可補一行清整版。
-6) 備註最小充分、無指令口吻；避免多餘解釋。
+- 不要使用【? ?】任何形式；若詞義不清，保留原文字面，僅在備註說明「…語義不清／建議核對」。
+- 翻譯行不得殘留羅馬字外語而未翻；一律翻成中文，並以（原文）保留對照。
+- 嚴禁使用破折號—或——；以；或、替代。
+- 不要創造、搬運或包裹任何一行於方括號[]；僅在原句本身有此標記且影響理解時，在備註描述之。
+- 僅當原句雜訊極多且影響閱讀時，才新增一行「清整版：……」（可省略）。
 
-=== INPUT ===
-You will receive the source inside <source>…</source>.
-Always follow the FORMAT strictly for every sentence/unit. If you cannot translate a piece,仍須輸出規定欄位（可留空或寫「待核對」）。`;
+INPUT:
+You will receive:
+PRINT_HEADER: YES or NO
+<source>…text…</source>
+Respect PRINT_HEADER strictly.`;
 
-    // --- PROMPT FOR MODE B (Mandarin Chinese only) ---
-    const systemPromptModeB = `
-You are a transcription model operating in Mode B.
-Use this ONLY when the source is Modern Standard Chinese (Mandarin).
-If the source is any other language or a Chinese dialect (Cantonese, Hokkien, Hakka, Shanghainese/Wu, Taiwanese, etc.), DO NOT use Mode B—use Mode A.
+  const systemPromptModeB = `
+You are a transcription model operating in Mode B (Modern Standard Chinese only).
+If the source is any other language or a Chinese dialect, do NOT use Mode B—use Mode A.
 
-=== OUTPUT HEADER (print once at the top) ===
-免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質等因素而不完全準確；請務必自行複核與修訂。本服務對因錯誤所致任何損失概不負責。
-（說明：括號（）內的中文釋義／補充由系統為協助理解所加，非原文內容。方括號[] 為噪音等說明。切勿使用破折號—或——。）
+=== OUTPUT HEADER (print once only if PRINT_HEADER=YES) ===
+免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質等因素而不完全準確；請務必自行複核與修訂。本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。
+（說明：括號（）內為系統加入之中文釋義（若有）；方括號[] 僅用於原句已存在的雜訊標記，且只在影響正確性時於備註提及。嚴禁使用破折號—或——，請改用；或、。）
 
-//// 以下是您的中文逐字稿 //// 客服聯繫 HELP@VOIXL.COM ///// 感謝您的訂購與支持 ////
+=== FORMAT per sentence/unit (no translation line) ===
+<ORIGINAL line in Chinese exactly as spoken。若 ASR 為簡體，轉為繁體字形；不改詞。不得包裹方括號。>
 
-（在上述標頭後留兩個空行再開始輸出）
+（可選）備註：僅當有助於判讀時，短且客觀（如：日期格式含糊；數字發音不清；人名存疑）。不使用破折號。
 
-=== FORMAT（每句／自然語意單位重複以下結構；Mode B 無「翻譯」行）===
-[ORIGINAL（中文）— 逐字呈現；若 ASR 為簡體，轉為繁體字形；不改詞。可就地於外語詞後加（中文釋義），但不得新增外語。]
+(blank line)
 
-(leave ONE blank line)
+CORE:
+- 不要使用【? ?】；若詞義不清，保留原句，僅在備註說明。
+- 不複製噪音標記到別行；不要人為新增方括號。
+- 嚴禁破折號—或——；用；或、代替。
+- 只做字形轉換（簡→繁），不做語詞修飾。
 
-[OPTIONAL — 僅在有價值時添加]
-備註：[簡短客觀；如：日期格式含糊（MM/DD 或 DD/MM）；數字發音不清，建議核對；人名／地名存疑；噪音可能影響正確性等。不要使用【?…?】或破折號—、——。]
+INPUT:
+PRINT_HEADER: YES or NO
+<source>…text…</source>
+Respect PRINT_HEADER strictly.`;
 
-(leave ONE blank line, then continue)
+  const systemPrompt = mode === 'B' ? systemPromptModeB : systemPromptModeA;
+  const preferred = process.env.TRANSLATION_MODEL || "gpt-5-mini";
 
-=== CORE RULES ===
-1) 忠實呈現；不捏造、不刪改、不任意拆／合句；簡體僅轉字形為繁體。
-2) 括號（）一律為中文釋義；不得新增外語。
-3) 方括號只在原句中標示噪音等；不要複製到其他行。
-4) 不確定處以備註描述關鍵詞／片段，不要在原文加【?…?】。
-5) 切勿使用破折號—或——。
+  const userPayload =
+    `PRINT_HEADER: ${emitHeader ? 'YES' : 'NO'}\n<source>\n${originalAll || ""}\n</source>`;
 
-=== INPUT ===
-You will receive the source inside <source>…</source>.
-Always follow the FORMAT strictly for every sentence/unit.`;
+  try {
+    const resp = await openai.responses.create({
+      model: preferred,
+      input: [
+        { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+        { role: "user", content: [{ type: "input_text", text: userPayload }] },
+      ],
+    });
 
-    // --- LOGIC TO SELECT THE CORRECT PROMPT ---
-    const systemPrompt = mode === 'B' ? systemPromptModeB : systemPromptModeA;
+    let out =
+      (resp.output_text && resp.output_text.trim()) ||
+      (Array.isArray(resp.output)
+        ? resp.output.flatMap(o => (o?.content || []))
+          .map(c => (typeof c?.text === "string" ? c.text : ""))
+          .join("").trim()
+        : "");
 
-    const preferred = process.env.TRANSLATION_MODEL || "gpt-5-mini";
+    out = postProcessText(out);
+    if (out) return out;
+    await addStep(requestId, `Responses output empty from ${preferred}; falling back.`);
+  } catch (e) {
+    const msg = e?.response?.data?.error?.message || e?.message || String(e);
+    await addStep(requestId, `Responses API failed (${preferred}): ${msg}; falling back.`);
+  }
 
-    // Try Responses API first (works with reasoning/thinking models if enabled)
+  // Chat fallback
+  const chatCandidates = ["gpt-4.1-mini", "gpt-4o-mini"];
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user",   content: userPayload },
+  ];
+
+  for (const model of chatCandidates) {
     try {
-        const resp = await openai.responses.create({
-            model: preferred,
-            input: [
-                { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
-                { role: "user", content: [{ type: "input_text", text: `<source>\n${originalAll || ""}\n</source>` }] },
-            ],
-        });
-
-        const out =
-            (resp.output_text && resp.output_text.trim()) ||
-            (Array.isArray(resp.output)
-                ? resp.output
-                    .flatMap(o => (o?.content || []))
-                    .map(c => (typeof c?.text === "string" ? c.text : ""))
-                    .join("")
-                    .trim()
-                : "");
-
-        if (out) return out;
-
-        await addStep(requestId, `Responses output empty from ${preferred}; falling back.`);
-    } catch (e) {
-        const msg = e?.response?.data?.error?.message || e?.message || String(e);
-        await addStep(requestId, `Responses API failed (${preferred}): ${msg}; falling back.`);
-    }
-
-    // Fallback to Chat Completions (stable, widely available)
-    const chatCandidates = ["gpt-4.1-mini", "gpt-4o-mini"];
-    const messages = [
-        { role: "system", content: systemPrompt },
-        { role: "user",   content: `<source>\n${originalAll || ""}\n</source>` },
-    ];
-
-    for (const model of chatCandidates) {
-        try {
-            const r = await axiosOpenAI.post(
-                "https://api.openai.com/v1/chat/completions",
-                { model, temperature: 0, messages, response_format: { type: "text" } },
-                {
-                    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-                    validateStatus: () => true,
-                }
-            );
-            if (r.status >= 200 && r.status < 300) {
-                const out = r.data?.choices?.[0]?.message?.content?.trim();
-                if (out) {
-                    if (model !== preferred) await addStep(requestId, `Used fallback chat model: ${model}`);
-                    return out;
-                }
-                await addStep(requestId, `Chat output empty from ${model}; trying next.`);
-            } else {
-                await addStep(
-                    requestId,
-                    `Chat API error (${model}): ${r.data?.error?.message || `HTTP ${r.status}`}`
-                );
-            }
-        } catch (e) {
-            await addStep(requestId, `Chat API exception (${model}): ${e?.message || e}`);
+      const r = await axiosOpenAI.post(
+        "https://api.openai.com/v1/chat/completions",
+        { model, temperature: 0, messages, response_format: { type: "text" } },
+        {
+          headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+          validateStatus: () => true,
         }
+      );
+      if (r.status >= 200 && r.status < 300) {
+        let out = r.data?.choices?.[0]?.message?.content?.trim() || "";
+        out = postProcessText(out);
+        if (out) {
+          if (model !== preferred) await addStep(requestId, `Used fallback chat model: ${model}`);
+          return out;
+        }
+        await addStep(requestId, `Chat output empty from ${model}; trying next.`);
+      } else {
+        await addStep(
+          requestId,
+          `Chat API error (${model}): ${r.data?.error?.message || `HTTP ${r.status}`}`
+        );
+      }
+    } catch (e) {
+      await addStep(requestId, `Chat API exception (${model}): ${e?.message || e}`);
     }
+  }
 
-    // Last resort: never return blank
-    return "【翻譯暫不可用：已附上原文】\n\n" + (originalAll || "");
+  return "【翻譯暫不可用：已附上原文】\n\n" + (originalAll || "");
 }
 
+// ban em-dash; strip 【? ?】 markers if any slipped through; normalize extra square-bracket wrappers
+function postProcessText(t=""){
+  return t
+    .replace(/【\?\s*([^【】]+?)\s*\?】/g, "$1")   // drop uncertain marker but keep inner text
+    .replace(/[—–]+/g, "；")                     // ban em/en dashes
+    .replace(/\r\n/g, "\n");
+}
 
 // ---------- main processor ----------
-async function processJob({ email, inputPath, fileMeta, requestId, jobId, token, forceLang = '', forceMode = '' }) { // Fix 3: new params
+async function processJob({ email, inputPath, fileMeta, requestId, jobId, token, forceLang = '', forceMode = '' }) {
   await setJobStatus(requestId, "processing");
   await updateStatus(requestId, "processing");
 
@@ -790,7 +786,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
       parts = segs;
     }
 
-    // compute duration from encoded parts
+    // duration per part
     async function getSeconds(filePath) {
       return new Promise((resolve, reject) => {
         ffmpeg.ffprobe(filePath, (err, meta) => {
@@ -800,7 +796,12 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
       });
     }
     let jobSeconds = 0;
-    for (const p of parts) jobSeconds += await getSeconds(p);
+    const partDurations = [];
+    for (const p of parts) {
+      const s = Math.round(await getSeconds(p));
+      partDurations.push(s);
+      jobSeconds += s;
+    }
     jobSeconds = Math.round(jobSeconds);
 
     const minutesForDb = secsToSheetMinutes(jobSeconds);
@@ -828,7 +829,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
     const tasks = parts.map((filePath, idx) => async () => {
       addStep(requestId, `Part ${idx + 1}/${parts.length} → start`);
       const res = await withRetries(
-        () => openaiTranscribeVerbose(filePath, requestId, forceLang || null), // Fix 2: pass lang hint
+        () => openaiTranscribeVerbose(filePath, requestId, forceLang || null),
         { maxAttempts: 5, baseDelayMs: 700 }
       );
       addStep(requestId, `Part ${idx + 1}/${parts.length} → done`);
@@ -836,173 +837,91 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
     });
     const results = await runBounded(tasks, concurrency);
 
-    let originalAll = "";
-    const detectedLangs = [];
-    for (const verbose of results) {
+    // Combine segments chronologically across parts (Gemini plan)
+    let allSegments = [];
+    let detectedLangs = [];
+    let offset = 0;
+    for (let i = 0; i < results.length; i++) {
+      const verbose = results[i];
       if (verbose?.language) detectedLangs.push(verbose.language);
-      originalAll += (originalAll ? "\n\n" : "") + (verbose?.text || "");
+      const segs = Array.isArray(verbose?.segments) ? verbose.segments : [];
+      for (const seg of segs) {
+        allSegments.push({
+          start: Number(seg.start || 0) + offset,
+          end: Number(seg.end || 0) + offset,
+          text: String(seg.text || "").trim(),
+        });
+      }
+      offset += Number(partDurations[i] || 0);
     }
-    if (forceLang) {
-      language = forceLang;
-      addStep(requestId, `force_lang applied: "${forceLang}"`);
-    } else if (!language && detectedLangs.length) {
-      const tally = {};
-      for (const l of detectedLangs) tally[l] = (tally[l] || 0) + 1;
-      language = Object.entries(tally).sort((a,b)=>b[1]-a[1])[0][0];
+    allSegments.sort((a,b)=>a.start-b.start);
+
+    // Fallback if segments missing
+    if (!allSegments.length) {
+      let originalAll = "";
+      for (const v of results) originalAll += (originalAll ? "\n\n" : "") + (v?.text || "");
+      detectedLangs = detectedLangs.length ? detectedLangs : [''];
+      const decision = decideChinese(detectedLangs, originalAll);
+      const mode = (forceMode === 'A' || forceMode === 'B') ? forceMode : (decision.isChinese ? 'B' : 'A');
+      language = forceLang || decision.finalLang || language || '';
+      addStep(requestId, `Mode decision (no segments): langs=${JSON.stringify(detectedLangs)}; reason=${decision.reason}; → ${mode==='B'?'Mode B (Chinese)':'Mode A (non-Chinese)'}`);
+      addStep(requestId, "Calling GPT for translation…");
+      const zh = await gptTranslateFaithful(originalAll, requestId, mode, true);
+      await deliverAndRecord({ requestId, email, fileMeta, fileName, fileType, jobSeconds, zhTraditional: zh, originalAll, started, minutesForDb, cumulativeSeconds, cumulativeMinutesForDb, language: language || decision.finalLang || '', translationMode: mode });
+      return;
     }
 
-    // --- START: ROBUST MODE SELECTION LOGIC (Fix 4 + dialect preference) ---
-    let translationMode = 'A';
-    if (forceMode === 'A' || forceMode === 'B') {
-      translationMode = forceMode;
-      addStep(requestId, `force_mode applied: ${translationMode}`);
-    } else {
-      const decision = decideModeAorB(detectedLangs, originalAll);
-      translationMode = decision.mode;
-      if (!language || decision.finalLang) language = decision.finalLang || language;
-      addStep(
-        requestId,
-        `Mode decision: langs=${JSON.stringify(detectedLangs)}; reason=${decision.reason}; ` +
-        `→ ${translationMode === 'B' ? 'Mode B (Mandarin)' : 'Mode A (non-Mandarin/dialect or non-Chinese)'}`
-      );
-    }
-    // --- END: ROBUST MODE SELECTION LOGIC ---
+    // Group consecutive segments by script + Mandarin-likeliness
+    const blocks = [];
+    const pickModeForText = (txt) => {
+      const script = classifyScript(txt);
+      if (forceMode === 'A' || forceMode === 'B') return forceMode;
+      if (script === 'zh') {
+        const ms = mandarinScore(txt);
+        return ms >= 0.16 ? 'B' : 'A'; // threshold tuned to prefer Mode A for dialect/gibberish
+      }
+      return 'A';
+    };
 
-    // zh-TW faithful translation
-    addStep(requestId, "Calling GPT for translation…");
+    let cur = { mode: pickModeForText(allSegments[0].text), text: "" };
+    for (const seg of allSegments) {
+      const m = pickModeForText(seg.text);
+      if (m === cur.mode) {
+        cur.text += (cur.text ? " " : "") + seg.text;
+      } else {
+        blocks.push(cur);
+        cur = { mode: m, text: seg.text };
+      }
+    }
+    blocks.push(cur);
+
+    // Build originals for email/docx (just the stitched text)
+    const originalAll = allSegments.map(s => s.text).join(" ").replace(/\s+\n\s+/g,"\n").trim();
+
+    // Translate per block; print header once on first block only
+    addStep(requestId, `Block count: ${blocks.length}. Translating per block…`);
     let zhTraditional = "";
-    try {
-        const inputForGpt = originalAll || "";
-        zhTraditional = await gptTranslateFaithful(inputForGpt, requestId, translationMode);
-        addStep(requestId, "繁中 done.");
-    } catch (e) {
-        addStep(requestId, "⚠️ GPT translation failed — sending original only. Error: " + (e?.message || e));
-        zhTraditional = "";
+    for (let i = 0; i < blocks.length; i++) {
+      const b = blocks[i];
+      const out = await gptTranslateFaithful(b.text, requestId, b.mode, i === 0);
+      zhTraditional += (i === 0 ? "" : "\n") + out;
     }
 
-    // email with attachments (Fix 5)
-    const localStamp = fmtLocalStamp(new Date());
-    const emailSubject = translationMode === 'B'
-      ? '您的中文逐字稿（原文＋備註）'
-      : '您的逐字稿（原文＋繁體中文翻譯）';
-    const headerZh = translationMode === 'B'
-      ? '＝＝ 中文逐字稿（繁體） ＝＝'
-      : '＝＝ 中文（繁體） ＝＝';
-    const attachmentText = `${headerZh}
-${zhTraditional}
+    // choose overall language/mode info for DB/email subject
+    const decision = decideChinese(detectedLangs, originalAll);
+    if (!language || forceLang) language = forceLang || decision.finalLang || language || '';
+    const overallMode = (forceMode === 'A' || forceMode === 'B')
+      ? forceMode
+      : (blocks.every(b=>b.mode==='B') ? 'B' : (blocks.every(b=>b.mode==='A') ? 'A' : 'A')); // default to A if mixed
 
-＝＝ 原文 ＝＝
-${originalAll}
-`;
-    const safeBase =
-      (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
-    const txtName = `${safeBase}-${requestId}.txt`;
-    const docxName = `${safeBase}-${requestId}.docx`;
-    const doc = new Document({
-      sections: [
-        {
-          children: [
-            new Paragraph(headerZh),
-            ...String(zhTraditional || "")
-              .split("\n")
-              .map((line) => new Paragraph(line)),
-            new Paragraph(""),
-            new Paragraph("＝＝ 原文 ＝＝"),
-            ...String(originalAll || "")
-              .split("\n")
-              .map((line) => new Paragraph(line)),
-          ],
-        },
-      ],
+    await deliverAndRecord({
+      requestId, email, fileMeta, fileName, fileType, jobSeconds,
+      zhTraditional, originalAll, started,
+      minutesForDb, cumulativeSeconds, cumulativeMinutesForDb,
+      language: language || decision.finalLang || '',
+      translationMode: overallMode
     });
-    const docxBuffer = await Packer.toBuffer(doc);
 
-    addStep(requestId, "Sending email …");
-    await mailer.sendMail({
-      from: `${FROM_NAME} <${FROM_EMAIL}>`,
-      to: email,
-      replyTo: FROM_EMAIL,
-      subject: emailSubject, // Fix 5
-      text: `轉寫已完成 ${localStamp}
-
-本次上傳時長（秒）：${jobSeconds}
-檔案名稱：${fileMeta.originalname}
-
-（服務單號：${requestId}）`,
-      attachments: [
-        {
-          filename: txtName,
-          content: attachmentText,
-          contentType: "text/plain; charset=utf-8",
-        },
-        {
-          filename: docxName,
-          content: docxBuffer,
-          contentType:
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        },
-      ],
-    });
-    addStep(requestId, "Email sent.");
-
-    // save to PHP so dashboard download buttons work
-    await storeTranscript(requestId, attachmentText, docxBuffer);
-
-    // insert transcriptions row
-    try {
-      const sql = `
-        INSERT INTO transcriptions (
-          timestamputc, timestamplocal, email,
-          jobseconds, cumulativeseconds, minutes, cumulativeminutes,
-          filename, filesizemb, language, requestid, processingms,
-          succeeded, errormessage, model, filetype
-        )
-        VALUES (
-          $1, $2, $3, $4, $5, $6, $7,
-          $8, $9, $10, $11, $12,
-          $13, $14, $15, $16
-        )
-      `;
-      const values = [
-        new Date(),
-        localStamp,
-        email,
-        jobSeconds,
-        cumulativeSeconds,
-        minutesForDb,
-        cumulativeMinutesForDb,
-        fileName,
-        fileSizeMB,
-        language || "",
-        requestId,
-        Date.now() - started,
-        true,
-        "",
-        model,
-        fileType,
-      ];
-      await pool.query(sql, values);
-      addStep(requestId, "Database record created.");
-    } catch (e) {
-      addStep(requestId, "⚠️ Database insert failed: " + (e?.message || e));
-    }
-
-    await consume({
-      event: "transcription.finished",
-      status: "succeeded",
-      email,
-      filename: fileName,
-      request_id: requestId,
-      job_id: jobId || "",
-      token: token || "",
-      duration_sec: jobSeconds,
-      charged_seconds: jobSeconds,
-      language: language || "",
-      finished_at: new Date().toISOString(),
-    });
-    await updateStatus(requestId, "succeeded", jobSeconds);
-    await setJobStatus(requestId, "done");
-    addStep(requestId, "✅ Done");
   } catch (err) {
     const eMsg = err?.message || "Processing error";
     addStep(requestId, "❌ " + eMsg);
@@ -1024,12 +943,144 @@ ${originalAll}
     await updateStatus(requestId, "processing_fail");
   } finally {
     addStep(requestId, "Cleaning up temporary files...");
+    // do not delete original upload path here; multer cleans /tmp automatically; but keep previous behavior:
     for (const f of Array.from(tempFiles)) {
       try {
         if (f && fs.existsSync(f)) fs.unlinkSync(f);
       } catch {}
     }
   }
+}
+
+// helper to email/store/db record
+async function deliverAndRecord({
+  requestId, email, fileMeta, fileName, fileType, jobSeconds,
+  zhTraditional, originalAll, started,
+  minutesForDb, cumulativeSeconds, cumulativeMinutesForDb,
+  language, translationMode
+}) {
+  const localStamp = fmtLocalStamp(new Date());
+  const emailSubject = translationMode === 'B'
+    ? '您的中文逐字稿（原文＋備註）'
+    : '您的逐字稿（原文＋繁體中文翻譯）';
+  const headerZh = translationMode === 'B'
+    ? '＝＝ 中文逐字稿（繁體） ＝＝'
+    : '＝＝ 中文（繁體） ＝＝';
+
+  const attachmentText = `${headerZh}
+${zhTraditional}
+
+＝＝ 原文 ＝＝
+${originalAll}
+`;
+
+  const safeBase =
+    (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
+  const txtName = `${safeBase}-${requestId}.txt`;
+  const docxName = `${safeBase}-${requestId}.docx`;
+  const doc = new Document({
+    sections: [
+      {
+        children: [
+          new Paragraph(headerZh),
+          ...String(zhTraditional || "")
+            .split("\n")
+            .map((line) => new Paragraph(line)),
+          new Paragraph(""),
+          new Paragraph("＝＝ 原文 ＝＝"),
+          ...String(originalAll || "")
+            .split("\n")
+            .map((line) => new Paragraph(line)),
+        ],
+      },
+    ],
+  });
+  const docxBuffer = await Packer.toBuffer(doc);
+
+  addStep(requestId, "Sending email …");
+  await mailer.sendMail({
+    from: `${FROM_NAME} <${FROM_EMAIL}>`,
+    to: email,
+    replyTo: FROM_EMAIL,
+    subject: emailSubject,
+    text: `轉寫已完成 ${localStamp}
+
+本次上傳時長（秒）：${jobSeconds}
+檔案名稱：${fileMeta.originalname}
+
+（服務單號：${requestId}）`,
+    attachments: [
+      {
+        filename: txtName,
+        content: attachmentText,
+        contentType: "text/plain; charset=utf-8",
+      },
+      {
+        filename: docxName,
+        content: docxBuffer,
+        contentType:
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      },
+    ],
+  });
+  addStep(requestId, "Email sent.");
+
+  await storeTranscript(requestId, attachmentText, docxBuffer);
+
+  try {
+    const sql = `
+      INSERT INTO transcriptions (
+        timestamputc, timestamplocal, email,
+        jobseconds, cumulativeseconds, minutes, cumulativeminutes,
+        filename, filesizemb, language, requestid, processingms,
+        succeeded, errormessage, model, filetype
+      )
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7,
+        $8, $9, $10, $11, $12,
+        $13, $14, $15, $16
+      )
+    `;
+    const values = [
+      new Date(),
+      localStamp,
+      email,
+      jobSeconds,
+      cumulativeSeconds,
+      minutesForDb,
+      cumulativeMinutesForDb,
+      fileName,
+      Math.max(0.01, Math.round(((fileMeta.size || 0) / (1024 * 1024)) * 100) / 100),
+      language || "",
+      requestId,
+      Date.now() - started,
+      true,
+      "",
+      "whisper-1",
+      fileType,
+    ];
+    await pool.query(sql, values);
+    addStep(requestId, "Database record created.");
+  } catch (e) {
+    addStep(requestId, "⚠️ Database insert failed: " + (e?.message || e));
+  }
+
+  await consume({
+    event: "transcription.finished",
+    status: "succeeded",
+    email,
+    filename: fileName,
+    request_id: requestId,
+    job_id: "",
+    token: "",
+    duration_sec: jobSeconds,
+    charged_seconds: jobSeconds,
+    language: language || "",
+    finished_at: new Date().toISOString(),
+  });
+  await updateStatus(requestId, "succeeded", jobSeconds);
+  await setJobStatus(requestId, "done");
+  addStep(requestId, "✅ Done");
 }
 
 // ---------- routes (ACK-first upload) ----------
@@ -1060,7 +1111,6 @@ app.post(
     const requestId =
       (req.body?.request_id || "").toString().trim() || crypto.randomUUID();
 
-    // Respond first so frontend doesn't see DB blips
     res.status(202).json({ success: true, accepted: true, requestId });
 
     setImmediate(async () => {
@@ -1074,7 +1124,6 @@ app.post(
           );
         }
 
-        // Fix 3: read QA overrides
         const force_lang = (req.body?.force_lang || '').toString().trim();
         const force_mode = (req.body?.force_mode || '').toString().trim().toUpperCase();
 
@@ -1149,8 +1198,7 @@ app.get("/", (_req, res) =>
 );
 
 const port = process.env.PORT || 3000;
-// <<< FIX: capture server and relax default Node timeouts
 const server = app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
-server.requestTimeout = 0;        // no overall per-request timeout
-server.headersTimeout = 0;        // allow slow clients to send headers
+server.requestTimeout = 0;
+server.headersTimeout = 0;
 server.keepAliveTimeout = 60_000;
