@@ -573,7 +573,7 @@ insert a blank line before next original sentence.
 Mode A rules & guidelines
 1) original sentence must be 100% matching with the speaker. no removal of repeated words, no fixing, no hallucination, no editing or assumptions.
 2) translations must translate everything into Chinese, with parentheses followed immediately; note: only need parentheses for proper nouns like names, brands, or culturally specific places that lack direct English equivalents; do not need parentheses for common nouns or universally understood terms. See example 1.
-
+3) 備註 footnotes will only appear under these circumstances: when there are uncertainty in words or phrases that needs assistance with clarifications. See example 2.
 Example 1:
 
 Hi everyone, my name is David Garcia Lopez, and I'm born and raised in the San Fernando Valley, just down at 7th street, next to Robinson and Stater Brothers.
