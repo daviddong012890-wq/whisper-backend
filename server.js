@@ -618,8 +618,6 @@ This mode is ONLY for Modern Standard Chinese (Mandarin). For any other language
 
 [此處直接放置 ASR 輸出轉寫成的**繁體中文**逐字稿。**不要**加上任何前綴。每句話自成一行。]
 
-（空一行）
-
 （可選）備註：[此處放置簡潔、客觀且有價值的註釋。此行**必須以「備註：」作為開頭**。]
 
 （空一行後，處理下一句）
