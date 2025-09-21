@@ -291,39 +291,40 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ---------- language helpers (Fix 1) ----------
-function isChineseLang(code) {
-  const c = (code || '').toLowerCase().trim();
-  const sinitic = [
-    'zh', 'zh-cn', 'zh-tw', 'zh-hk', // Chinese
-    'cmn', 'yue', 'wuu', 'gan', 'hak', 'nan' // Mandarin, Cantonese, Wu, Gan, Hakka, Minnan
+// ---------- language helpers (Fix 1 + updates) ----------
+function isMandarinLang(code) {
+  const c = (code || "").toLowerCase().trim();
+  const mandarin = [
+    "zh", "zh-cn", "zh-tw", "zh-hk", "zh-hans", "zh-hant", "cmn"
   ];
-  return sinitic.some(p => c === p || c.startsWith(p));
+  return mandarin.some(p => c === p || c.startsWith(p));
+}
+function isChineseDialectLang(code) {
+  const c = (code || "").toLowerCase().trim();
+  const dialects = ["yue", "wuu", "gan", "hak", "nan", "hsn", "cdo", "mnp"]; // Cantonese, Wu/Shanghai, Gan, Hakka, Minnan/Taiwanese, Xiang, Min Dong, Northern Min
+  return dialects.some(p => c === p || c.startsWith(p));
 }
 function cjkRatio(text) {
   if (!text) return 0;
-  const cjk = text.match(/[\u3400-\u4DBF\u4E00-\u9FFF]/g) || []; // CJK Ext-A + Unified
+  const cjk = text.match(/[\u3400-\u4DBF\u4E00-\u9FFF]/g) || [];
   return cjk.length / text.length;
 }
-function decideChinese(langs, text) {
-  const counts = {};
-  for (const l of langs) {
-    const k = (l || '').toLowerCase();
-    counts[k] = (counts[k] || 0) + 1;
-  }
-  let topLang = '';
-  let topCount = -1;
-  for (const [k, v] of Object.entries(counts)) {
-    if (v > topCount) { topCount = v; topLang = k; }
-  }
-  if (isChineseLang(topLang)) {
-    return { isChinese: true, finalLang: topLang, reason: `majority language "${topLang}"` };
-  }
+function decideModeAorB(langs, text) {
+  const low = (langs || []).map(l => (l || "").toLowerCase());
+  // Prefer explicit dialect → Mode A
+  const dialectHit = low.find(isChineseDialectLang);
+  if (dialectHit) return { mode: "A", finalLang: dialectHit, reason: `Chinese dialect "${dialectHit}"` };
+
+  // Explicit Mandarin → Mode B
+  const mandarinHit = low.find(isMandarinLang);
+  if (mandarinHit) return { mode: "B", finalLang: mandarinHit, reason: `Mandarin "${mandarinHit}"` };
+
+  // High CJK ratio but no explicit Mandarin code → treat as unknown CJK → Mode A
   const ratio = cjkRatio(text);
-  if (ratio > 0.20) {
-    return { isChinese: true, finalLang: topLang || 'zh', reason: `CJK ratio ${(ratio*100).toFixed(1)}%` };
-  }
-  return { isChinese: false, finalLang: topLang || '', reason: topLang ? `majority language "${topLang}"` : 'no language reported' };
+  if (ratio > 0.2) return { mode: "A", finalLang: "", reason: `CJK ratio ${(ratio*100).toFixed(1)}% (unknown CJK)` };
+
+  // Default for everything else → Mode A
+  return { mode: "A", finalLang: low[0] || "", reason: low[0] ? `majority "${low[0]}"` : "no language reported" };
 }
 
 // ---------- keep-alive axios for OpenAI (reduces "socket hang up") ----------
@@ -583,97 +584,82 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // ---------- GPT translation (Responses API + fallbacks) ----------
 async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
     
-    // --- PROMPT FOR MODE A (All Languages Except Chinese) ---
+    // --- PROMPT FOR MODE A (All Languages Except Mandarin Chinese) ---
     const systemPromptModeA = `
 You are a transcription & translation model operating in Mode A.
-Use this for ANY source that is NOT Modern Standard Chinese (Mandarin). 
+Use this for ANY source that is NOT Modern Standard Chinese (Mandarin).
 Includes English, Spanish, French, German, Vietnamese, Japanese, Italian, Czech, etc.,
-and Chinese dialects (Cantonese, Hokkien, Hakka, Shanghainese, Taiwanese, etc.) even if written with Han characters.
+and Chinese dialects (Cantonese, Hokkien, Hakka, Shanghainese/Wu, Taiwanese, etc.) even if written with Han characters.
 
 === OUTPUT HEADER (print once at the top) ===
-免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。請務必自行複核與修訂。本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。
-（說明：括號（）與方括號[] 內的內容為系統為協助理解所加入，非原文內容。Mode A 的「翻譯」行中，括號可包含原文外語詞或中文釋義，以利核對。）
+免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質等因素而不完全準確；請務必自行複核與修訂。本服務對因錯誤所致任何損失概不負責。
+（說明：括號（）與方括號[] 內的中文說明為系統為協助理解所加入，非原文內容。切勿使用破折號—或——；請改用逗號、分號等標點。）
 
-//// 以下是您的中文逐字稿 //// 客服聯係 HELP@VOIXL.COM ///// 感謝您的訂購與支持 /////
+//// 以下是您的中文逐字稿 //// 客服聯繫 HELP@VOIXL.COM ///// 感謝您的訂購與支持 ////
 
 （在上述標頭後留兩個空行再開始輸出）
 
-=== FORMAT (repeat for each sentence / natural unit) ===
-[ORIGINAL sentence — the exact transcript as given by ASR; keep words, disfluencies, noise tags, etc. EXACTLY.]
+=== FORMAT（每句／自然語意單位重複以下結構）===
+[ORIGINAL sentence — ASR 原文逐字，不得改寫、刪除或插入任何符號；不要使用【?…?】之類標記。]
 
 (leave ONE blank line)
 
-翻譯：[Literal translation into Traditional Chinese, preserving all content and uncertainties.]
+翻譯：[把 ORIGINAL 逐字直譯成繁體中文；不得使用破折號—或——；必要時在專名或外語詞後加（原文外語）或（中文釋義）。]
 
-[Optionally add one or both lines ONLY if they add value; otherwise omit.]
+[OPTIONAL — 只有有價值才加]
+備註：[簡短客觀；例如：日期格式含糊（MM/DD 或 DD/MM）；數字發音不清，建議核對；人名/地名寫法存疑；有[重疊]/[雜音]/[音樂]/[笑聲]/[掌聲]且可能影響正確性等。不要重述無用事實。]
 
-備註：[短、客觀、有用的說明；例：
-- 日期格式含糊（MM/DD 或 DD/MM）。
-- 數字發音不清，建議核對。
-- 人名/地名發音或寫法存疑（如【? Jao ?】），建議核對。
-- 有[重疊]/[雜音]/[音樂]/[笑聲]/[掌聲]且可能影響正確性（若不影響則省略）。
-]
-
-清整版：[僅在原句雜訊極多且影響閱讀時提供一行「更易讀」之中文版本；非法律或事實依據；一般情況不要輸出。]
+[OPTIONAL — 僅在噪音極多且影響閱讀時提供]
+清整版：[更易讀的中文版本；中立、克制；非法律或事實依據。]
 
 (leave ONE blank line, then continue)
 
 === CORE RULES ===
-1) 忠實原文：ORIGINAL 必須與 ASR 輸出逐字一致；不可捏造、刪改、合併或任意拆分。
-2) 翻譯為繁中：以「逐字直譯」為主，完整保留資訊與不確定性。
-3) 【LOCK-IN #2】標記帶入原則（極重要）：
-   - [雜音]/[重疊]/[聽不清] 等僅存在於 ORIGINAL。
-   - 只有在影響關鍵資訊（如數字／代碼／姓名缺漏：例 73[聽不清]9）時，才在「翻譯」中保留該不確定標記；否則不要把方括號帶入翻譯。
-4) 括號用法（Mode A）：翻譯行允許在專名或外語詞後以「（原文外語）」或「（中文釋義）」輔助核對；這些皆為系統加入，非原文。
-   - 例：洛杉磯時報（Los Angeles Times）；tres leches（三奶蛋糕）；flan（焦糖布丁）。
-   - 常見通用詞不必一再附註。
-5) 不確定片段：用【? … ?】框出疑似字串（在 ORIGINAL、必要時在翻譯）；備註以中性語氣說明「…發音/寫法存疑，建議核對」。
-6) 多語混用：優先用翻譯行的括號就地說清；若外語處太多導致難讀，可加一行「清整版」輔助閱讀。
-7) 簡體→不轉：Mode A 面向非中文原文；若 ASR 偶有中文字，僅原樣保留，不做詞語修飾（保持忠實）。
-8) 文風：備註最小充分、無指令口吻；客觀、精簡、對事實負責。
+1) ORIGINAL 必須與 ASR 一致；不新增任何【?…?】或其他符號。
+2) 翻譯為繁中；保留不確定資訊；括號內容為系統輔助，必為中文或「原文外語」對照。
+3) 切勿使用破折號—或——。
+4) 僅在關鍵資訊受影響時於翻譯中保留方括號標記（如 73[聽不清]9）；一般噪音只寫在備註。
+5) 多語混用：優先在翻譯行就地用括號說清；若外語處太多導致難讀，可補一行清整版。
+6) 備註最小充分、無指令口吻；避免多餘解釋。
 
 === INPUT ===
-You will receive input inside a single <source>…</source> block.
-Produce the header once, then iterate the FORMAT block for each sentence/unit detected.
-`;
+You will receive the source inside <source>…</source>.
+Always follow the FORMAT strictly for every sentence/unit. If you cannot translate a piece,仍須輸出規定欄位（可留空或寫「待核對」）。`;
 
-    // --- PROMPT FOR MODE B (Chinese Language Only) ---
+    // --- PROMPT FOR MODE B (Mandarin Chinese only) ---
     const systemPromptModeB = `
 You are a transcription model operating in Mode B.
 Use this ONLY when the source is Modern Standard Chinese (Mandarin).
-If the source is any other language or a Chinese dialect (Cantonese, Hokkien, Hakka, Shanghainese, Taiwanese, etc.), DO NOT use Mode B—use Mode A.
+If the source is any other language or a Chinese dialect (Cantonese, Hokkien, Hakka, Shanghainese/Wu, Taiwanese, etc.), DO NOT use Mode B—use Mode A.
 
 === OUTPUT HEADER (print once at the top) ===
-免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。請務必自行複核與修訂。本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。
-（說明：括號（）內的中文釋義/補充由系統為協助理解所加入，非原文內容；Mode B 的括號只放「中文」釋義，不新增外語。方括號[] 為噪音／重疊等標記。）
+免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質等因素而不完全準確；請務必自行複核與修訂。本服務對因錯誤所致任何損失概不負責。
+（說明：括號（）內的中文釋義／補充由系統為協助理解所加，非原文內容。方括號[] 為噪音等說明。切勿使用破折號—或——。）
 
-//// 以下是您的中文逐字稿 //// 客服聯係 HELP@VOIXL.COM ///// 感謝您的訂購與支持 /////
+//// 以下是您的中文逐字稿 //// 客服聯繫 HELP@VOIXL.COM ///// 感謝您的訂購與支持 ////
 
 （在上述標頭後留兩個空行再開始輸出）
 
-=== FORMAT (repeat per sentence / natural unit; NO translation line in Mode B) ===
-[ORIGINAL sentence in Chinese, exactly as spoken. 若 ASR 為簡體，轉為繁體字形；不改詞。允許就地於外語詞後加（中文釋義），僅中文，且不變動原字序。]
+=== FORMAT（每句／自然語意單位重複以下結構；Mode B 無「翻譯」行）===
+[ORIGINAL（中文）— 逐字呈現；若 ASR 為簡體，轉為繁體字形；不改詞。可就地於外語詞後加（中文釋義），但不得新增外語。]
 
 (leave ONE blank line)
 
-[Optionally add this line ONLY if it adds value; otherwise omit.]
-備註：[短、客觀、有用；例：日期格式含糊（MM/DD 或 DD/MM）；數字發音不清，建議核對；人名/地名存疑；[重疊]/[雜音] 可能影響正確性時才標。]
+[OPTIONAL — 僅在有價值時添加]
+備註：[簡短客觀；如：日期格式含糊（MM/DD 或 DD/MM）；數字發音不清，建議核對；人名／地名存疑；噪音可能影響正確性等。不要使用【?…?】或破折號—、——。]
 
 (leave ONE blank line, then continue)
 
 === CORE RULES ===
-1) 忠實原文：逐字呈現；不捏造、不刪改、不任意拆/合句。簡體→僅轉繁體字形。
-2) 【LOCK-IN #1（Mode B）】括號（）一律為「中文釋義」，不得新增外語於括號。
-3) 方括號：在原句中使用 [雜音]、[重疊]、[聽不清] 等；不要另外複製到其他行。
-4) 不確定片段：用【? … ?】框出；需要時在備註中以中性語氣提請核對。
-5) 多語混用：優先就地以（中文釋義）標注；若仍不易讀，不輸出另外的翻譯行（Mode B 無翻譯行）。
-6) 備註最小充分；僅在明顯提升可讀性或正確性時添加。
-7) 斷句依自然停頓／明確標點；避免人為拆分或強併。
+1) 忠實呈現；不捏造、不刪改、不任意拆／合句；簡體僅轉字形為繁體。
+2) 括號（）一律為中文釋義；不得新增外語。
+3) 方括號只在原句中標示噪音等；不要複製到其他行。
+4) 不確定處以備註描述關鍵詞／片段，不要在原文加【?…?】。
+5) 切勿使用破折號—或——。
 
 === INPUT ===
-You will receive input inside a single <source>…</source> block.
-Produce the header once, then iterate the FORMAT block for each sentence/unit detected (Mode B has no separate translation line).
-`;
+You will receive the source inside <source>…</source>.
+Always follow the FORMAT strictly for every sentence/unit.`;
 
     // --- LOGIC TO SELECT THE CORRECT PROMPT ---
     const systemPrompt = mode === 'B' ? systemPromptModeB : systemPromptModeA;
@@ -865,29 +851,28 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
       language = Object.entries(tally).sort((a,b)=>b[1]-a[1])[0][0];
     }
 
-    // --- START: ROBUST MODE SELECTION LOGIC (Fix 4) ---
+    // --- START: ROBUST MODE SELECTION LOGIC (Fix 4 + dialect preference) ---
     let translationMode = 'A';
     if (forceMode === 'A' || forceMode === 'B') {
       translationMode = forceMode;
       addStep(requestId, `force_mode applied: ${translationMode}`);
     } else {
-      const decision = decideChinese(detectedLangs, originalAll);
-      translationMode = decision.isChinese ? 'B' : 'A';
+      const decision = decideModeAorB(detectedLangs, originalAll);
+      translationMode = decision.mode;
       if (!language || decision.finalLang) language = decision.finalLang || language;
       addStep(
         requestId,
         `Mode decision: langs=${JSON.stringify(detectedLangs)}; reason=${decision.reason}; ` +
-        `→ ${translationMode === 'B' ? 'Mode B (Chinese)' : 'Mode A (non-Chinese)'}`
+        `→ ${translationMode === 'B' ? 'Mode B (Mandarin)' : 'Mode A (non-Mandarin/dialect or non-Chinese)'}`
       );
     }
-    // --- END: ROBUST MODE SELECTION LOGIC (Fix 4) ---
+    // --- END: ROBUST MODE SELECTION LOGIC ---
 
     // zh-TW faithful translation
     addStep(requestId, "Calling GPT for translation…");
     let zhTraditional = "";
     try {
         const inputForGpt = originalAll || "";
-        // Pass the determined mode to the translation function
         zhTraditional = await gptTranslateFaithful(inputForGpt, requestId, translationMode);
         addStep(requestId, "繁中 done.");
     } catch (e) {
