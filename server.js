@@ -588,7 +588,7 @@ async function runBounded(tasks, limit = 3) {
   });
 }
 
-// ---------- GPT formatting prompts (2-Part System) ----------
+// ---------- GPT formatting prompts (Perfect 2-Part System) ----------
 function buildSystemPrompt(mode) {
   if (mode === 'B') {
     return `
@@ -600,7 +600,7 @@ This mode is ONLY for Modern Standard Chinese (Mandarin). For any other language
 You must output exactly these two sections with these exact headers:
 
 === ORIGINAL ===
-[此處直接放置 ASR 輸出轉寫成的**繁體中文**逐字稿原文，分為易讀的段落。保留原本的語氣。不要加上任何前綴。]
+[此處直接放置 ASR 輸出轉寫成的繁體中文逐字稿原文，分為易讀的段落。保留原本的語氣。不要加上任何前綴。]
 
 === TRANSLATION ===
 [此處放置經過「優化轉寫」與「標點符號修飾」後的完整繁體中文逐字稿，並分為易讀的段落。若根據下方原則判斷需要新增註釋，請直接在對應的句子後方使用括號加上 (註釋: ...)。]
@@ -612,7 +612,7 @@ You must output exactly these two sections with these exact headers:
     * **保留原貌**：保留口吃、重複詞、以及原文中已存在的 \`[雜音]\`、\`[重疊]\` 等標記。不要人為新增此類標記。
 
 2.  **優化轉寫 (Optimized Transcription)**
-    * **繁體轉換**：若 ASR 輸出為簡體字，僅做字形轉換為繁體中文，不更改地區用詞（例如，「视频」轉為「视频」，而非「影片」）。
+    * **繁體轉換**：若 ASR 輸出為簡體字，僅做字形轉換為繁體中文，不更改地區用詞（例如，「视频」轉為「視頻」，而非「影片」）。
     * **標點符號**：根據語氣和停頓，使用正確、全形的中文標點符號，如「，」「。」「？」。
     * **外語處理**：如遇外語詞，可直接保留原文，並在詞後以括號加上**中文釋義**，例如 \`เราต้องไป check-in（辦理登記）\`。括號內不得出現外語。
 
@@ -644,7 +644,7 @@ This mode is for ANY source that is NOT Modern Standard Chinese (Mandarin), incl
 You must output exactly these two sections with these exact headers:
 
 === ORIGINAL ===
-[直接放置逐字輸出 ASR 的完整原文段落（不要再包任何括號或符號；保留口吃、贅詞；若原句自帶噪音標記如 [雜音]、[重疊]，原樣保留）。分為易讀的段落。]
+[直接放置逐字輸出 ASR 的完整原文段落（不要再包任何括號或符號；保留口吃、贅詞；若原句自帶噪音標記如 [雜音]、[重疊]，原樣保留）。加入適當的標點符號並分為易讀的段落。]
 
 === TRANSLATION ===
 [將原文以繁體中文進行**通順且忠實的翻譯**。翻譯應自然流暢，易於閱讀，並分為易讀的段落。若根據下方「括號使用原則」需要新增註釋，請直接在對應的翻譯句子後方使用括號加上 (註釋: ...)。]
@@ -692,8 +692,7 @@ async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
         { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
         { role: "user", content: [{ type: "input_text", text: `<source>\n${originalAll || ""}\n</source>` }] },
       ],
-      // FIX: The Responses API requires exactly "max_output_tokens"
-      max_output_tokens: 4096 
+      // Parameter removed entirely to prevent silent proxy cut-offs and 400 errors
     });
 
     const out =
@@ -722,8 +721,8 @@ async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
   for (const model of chatCandidates) {
     try {
       const r = await openai.chat.completions.create({
-        // FIX: The Chat Completions API requires exactly "max_completion_tokens"
-        model, temperature: 0, messages, max_completion_tokens: 4096
+        // Parameter removed entirely to prevent silent proxy cut-offs and 400 errors
+        model, temperature: 0, messages
       });
       const out = r.choices?.[0]?.message?.content?.trim();
       if (out) {
@@ -909,7 +908,8 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
 
     // Group consecutive segments by inferred script/language AND limit size
     const blocks = [];
-    const MAX_CHARS_PER_BLOCK = 1000; 
+    // LOWERED DRASTICALLY to prevent silent proxy truncation errors and ensure 100% completion
+    const MAX_CHARS_PER_BLOCK = 600; 
 
     for (const seg of allSegments) {
       const kind = guessLangFromText(seg.text);
@@ -972,12 +972,12 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
  ///// 感謝您的訂購與支持 /////
 
 ========================================
-【第一部分：原文轉錄】Part 1, Original Language Transcribe
+Part 1, Original Language Transcribe
 ========================================
 ${finalPart1}
 
 ========================================
-【第二部分：繁體中文翻譯】Part 2, Traditional Chinese Translation
+Part 2, Traditional Chinese Translation
 ========================================
 ${finalPart2}
 `;
@@ -1001,12 +1001,12 @@ ${finalPart2}
             new Paragraph(" ///// 感謝您的訂購與支持 /////"),
             new Paragraph(""),
             new Paragraph("========================================"),
-            new Paragraph("【第一部分：原文轉錄】Part 1, Original Language Transcribe"),
+            new Paragraph("Part 1, Original Language Transcribe"),
             new Paragraph("========================================"),
             ...finalPart1.split("\n").map((line) => new Paragraph(line)),
             new Paragraph(""),
             new Paragraph("========================================"),
-            new Paragraph("【第二部分：繁體中文翻譯】Part 2, Traditional Chinese Translation"),
+            new Paragraph("Part 2, Traditional Chinese Translation"),
             new Paragraph("========================================"),
             ...finalPart2.split("\n").map((line) => new Paragraph(line)),
           ],
