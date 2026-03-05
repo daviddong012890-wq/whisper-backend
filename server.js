@@ -995,23 +995,23 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
  ///// 感謝您的訂購與支持 /////
 
 ========================================
-Part 1, Original Language Transcribe
+Part 1, Original Language Transcribe 第一部，原文稿
 ========================================
 ${finalPart1}
 
 ========================================
-Part 2, Traditional Chinese Translation
+Part 2, Traditional Chinese Translation 第二部，中文翻譯稿
 ========================================
 ${finalPart2}
 
 ========================================
-Part 3, Line by Line translation
+Part 3, Line by Line translation 第三部，逐行翻譯
 ========================================
 ${finalPart3}
 `;
 
     const localStamp = fmtLocalStamp(new Date());
-    const emailSubject = '您的逐字稿已完成（完整三部分版）';
+    const emailSubject = '您的逐字稿已完成';
     
     const safeBase = (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
     const txtName = `${safeBase}-${requestId}.txt`;
@@ -1029,17 +1029,17 @@ ${finalPart3}
             new Paragraph(" ///// 感謝您的訂購與支持 /////"),
             new Paragraph(""),
             new Paragraph("========================================"),
-            new Paragraph("Part 1, Original Language Transcribe"),
+            new Paragraph("Part 1, Original Language Transcribe 第一部，原文稿"),
             new Paragraph("========================================"),
             ...finalPart1.split("\n").map((line) => new Paragraph(line)),
             new Paragraph(""),
             new Paragraph("========================================"),
-            new Paragraph("Part 2, Traditional Chinese Translation"),
+            new Paragraph("Part 2, Traditional Chinese Translation 第二部，中文翻譯稿"),
             new Paragraph("========================================"),
             ...finalPart2.split("\n").map((line) => new Paragraph(line)),
             new Paragraph(""),
             new Paragraph("========================================"),
-            new Paragraph("Part 3, Line by Line translation"),
+            new Paragraph("Part 3, Line by Line translation 第三部，逐行翻譯"),
             new Paragraph("========================================"),
             ...finalPart3.split("\n").map((line) => new Paragraph(line)),
           ],
