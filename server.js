@@ -112,12 +112,14 @@ app.use(
 app.options("*", cors());
 app.use(express.json({ limit: "1mb" }));
 
-// <<< FIX: keep long uploads alive (disable per-request timeouts)
+// <<< FIX: Give uploads a maximum 45-minute limit instead of waiting forever
 app.use((req, _res, next) => {
-  try { req.setTimeout?.(0); } catch {}
+  const FORTY_FIVE_MINUTES = 45 * 60 * 1000; // 45 minutes in milliseconds
+  
+  try { req.setTimeout?.(FORTY_FIVE_MINUTES); } catch {}
   try {
     if (req.socket) {
-      req.socket.setTimeout?.(0);
+      req.socket.setTimeout?.(FORTY_FIVE_MINUTES);
       req.socket.setKeepAlive?.(true, 60_000);
     }
   } catch {}
@@ -128,8 +130,14 @@ app.use((req, _res, next) => {
 const MAX_UPLOAD_BYTES = Number(
   process.env.MAX_UPLOAD_BYTES || 1.5 * 1024 * 1024 * 1024
 ); // 1.5 GB default
+
+// Create the dedicated folder if it doesn't exist yet
+if (!fs.existsSync("/tmp/voixl")) {
+  fs.mkdirSync("/tmp/voixl", { recursive: true });
+}
+
 const upload = multer({
-  dest: "/tmp",
+  dest: "/tmp/voixl",
   limits: { fileSize: MAX_UPLOAD_BYTES },
   fileFilter: (_req, file, cb) => {
     const ok =
@@ -328,13 +336,9 @@ function decideChinese(langs, text) {
 
 // Extra heuristics for dialect-ish Chinese → prefer Mode A
 const DIALECT_MARKERS = [
-  // Cantonese
   '唔','冇','咗','喺','嚟','嗰','嘅','啲','咁','佢哋','邊度',
-  // Shanghainese / Wu (very rough)
   '侬','阿拉','伲','勿','伊拉','辰光','宁','沪','海派','老早',
-  // Hokkien / Minnan (very rough)
   '咱','嘛','閣','媠','袂','攏','曉','啥物','欲',
-  // Hakka (very rough)
   '該','伓','毋','佗位'
 ];
 function looksDialectChinese(text) {
@@ -356,7 +360,6 @@ function guessLangFromText(t) {
 }
 
 // ---------- keep-alive axios for OpenAI (reduces "socket hang up") ----------
-// (Left as-is; no longer used for OpenAI calls, but keeping it to avoid broader edits.)
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 
@@ -444,8 +447,6 @@ function estimateSizeBytes(seconds, kbps) {
   return Math.ceil(seconds * (kbps * 1000) / 8);
 }
 
-// Adaptive speech-first strategy: try 80k if it fits, else 64k, else 48k.
-// "needsSplit" means the whole clip won't fit target at the chosen bitrate.
 function chooseBitrateAndSplit(seconds) {
   const options = [80, 64, 48];
   for (const kb of options) {
@@ -454,7 +455,6 @@ function chooseBitrateAndSplit(seconds) {
       return { kbps: kb, needsSplit: false, estBytes: est };
     }
   }
-  // If none fit as a single file, pick the lowest (48) and segment.
   const kbps = options[options.length - 1];
   return { kbps, needsSplit: true, estBytes: estimateSizeBytes(seconds, kbps) };
 }
@@ -470,7 +470,7 @@ async function encodeSingleMp3(inPath, outMp3, kbps, requestId) {
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
-      .audioFilters(["dynaudnorm"]) // speech-safe normalization only
+      .audioFilters(["dynaudnorm"])
       .outputOptions([
         "-ac", "1",
         "-ar", "16000",
@@ -488,7 +488,7 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .noVideo()
-      .audioFilters(["dynaudnorm"]) // speech-safe normalization only
+      .audioFilters(["dynaudnorm"])
       .outputOptions([
         "-ac", "1",
         "-ar", "16000",
@@ -516,7 +516,7 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   maxRetries: 5,
-  timeout: 900_000, // 15 min
+  timeout: 900_000, 
 });
 
 // ---------- Whisper via SDK (Fix 2) ----------
@@ -536,7 +536,7 @@ async function openaiTranscribeVerbose(audioPath, requestId, langHint) {
       },
       { signal: controller.signal }
     );
-    return r; // already JSON
+    return r; 
   } catch (err) {
     console.error(
       `[${requestId}] Whisper transcribe error:`,
@@ -597,28 +597,28 @@ async function runBounded(tasks, limit = 3) {
   });
 }
 
-// ---------- GPT translation prompts (updated A/B) ----------
-function buildSystemPrompt(mode, includeHeader) {
+// ---------- GPT formatting prompts (3-Part System + Original Rules) ----------
+function buildSystemPrompt(mode) {
   if (mode === 'B') {
     return `
 You are an expert Chinese-language editor and transcription specialist operating in Mode B.
 Your purpose is to take a raw Mandarin Chinese ASR transcript and transform it into a clean, accurate, and professionally polished document.
 This mode is ONLY for Modern Standard Chinese (Mandarin). For any other language or Chinese dialect, you must refuse to use this mode.
 
-=== OUTPUT HEADER (print once at the top) ===
-免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。請務務必自行複核與修訂。本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。
-說明：括號（）與方括號[] 內的內容為系統為協助理解、整理與釐清而加入，非原文內容。
+=== 格式（分為三個部分輸出）===
+You must output exactly these three sections with these exact headers:
 
-//// 以下是您的中文逐字稿 //// 客服聯係 HELP@VOIXL.COM
- ///// 感謝您的訂購與支持 /////
+=== ORIGINAL ===
+[此處直接放置 ASR 輸出轉寫成的**繁體中文**逐字稿原文，分為易讀的段落。保留原本的語氣。不要加上任何前綴。]
 
-（在上述標頭後留兩個空行再開始輸出）
+=== TRANSLATION ===
+[此處放置經過「優化轉寫」與「標點符號修飾」後的完整繁體中文逐字稿，並分為易讀的段落。]
 
-=== 格式（為每個句子／自然單位重複此結構）===
-
-[此處直接放置 ASR 輸出轉寫成的**繁體中文**逐字稿。**不要**加上任何前綴。每句話自成一行。]
-
-（可選）備註：[此處放置簡潔、客觀且有價值的註釋。此行**必須以「備註：」作為開頭**。]
+=== LINE-BY-LINE ===
+[逐句提供對照]
+(原文)
+(優化後的繁體中文)
+(註釋: [此處放置簡潔、客觀且有價值的註釋。若無必要請勿加上此行])
 
 （空一行後，處理下一句）
 
@@ -647,7 +647,7 @@ This mode is ONLY for Modern Standard Chinese (Mandarin). For any other language
     * 嚴禁使用破折號 (\`—\` 或 \`——\`)。
 
 === INPUT ===
-你將在單一 <source>…</source> 區塊內收到全文。只打印一次標頭，然後嚴格遵循上述格式與原則，產出專業、清晰、且附有洞見的中文逐字稿。
+你將在單一 <source>…</source> 區塊內收到文本。嚴格遵循上述 3-Part 格式與原則產出內容。
 `;
   }
 
@@ -657,31 +657,22 @@ You are an expert transcription and translation assistant operating in Mode A.
 Your primary goal is to produce a clean, accurate, and highly readable translation.
 This mode is for ANY source that is NOT Modern Standard Chinese (Mandarin), including all foreign languages and Chinese dialects.
 
-=== OUTPUT HEADER (print once at the top) ===
-免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。請務必自行複核與修訂。本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。
-說明：括號（）與方括號[] 內的內容為系統為協助理解、整理與釐清而加入，非原文內容。
+=== FORMAT（分為三個部分輸出）===
+You must output exactly these three sections with these exact headers:
 
-//// 以下是您的中文逐字稿 //// 客服聯係 HELP@VOIXL.COM
- ///// 感謝您的訂購與支持 /////
+=== ORIGINAL ===
+[直接放置逐字輸出 ASR 的完整原文段落（不要再包任何括號或符號；保留口吃、贅詞；若原句自帶噪音標記如 [雜音]、[重疊]，原樣保留）。分為易讀的段落。]
 
-（在上述標頭後留兩個空行再開始輸出）
+=== TRANSLATION ===
+[將原文以繁體中文進行**通順且忠實的翻譯**。翻譯應自然流暢，易於閱讀，並分為易讀的段落。]
 
-=== FORMAT（對每個句子／自然單位重複）===
-直接放置逐字輸出 ASR 的原句（不要再包任何括號或符號；保留口吃、贅詞；若原句自帶噪音標記如 [雜音]、[重疊]，原樣保留）
+=== LINE-BY-LINE ===
+[逐句提供對照]
+(原文)
+(翻譯)
+(註釋: [僅在符合下方「括號使用原則」時提供簡短補充。])
 
-（留一個空行）
-
-翻譯：以繁體中文進行**通順且忠實的翻譯**。翻譯應自然流暢，易於閱讀。
-
-（可選）備註：**僅在絕對必要時**提供簡短、客觀、有效的補充，例如：
-- 語義含糊，建議核對。
-- 數字發音不清，建議核對。
-- 人名／地名發音或寫法存疑。
-- [重疊]／[雜音] 等嚴重影響內容準確性。
-
-（可選）清整版：僅當原文口語贅詞或雜訊極多，嚴重影響閱讀時，提供更精煉的中文版本（非法律或事實依據）。
-
-（留一個空行後，處理下一句）
+（空一行後，處理下一句）
 
 === CORE RULES ===
 
@@ -695,8 +686,7 @@ This mode is for ANY source that is NOT Modern Standard Chinese (Mandarin), incl
     - **核心目的**：註釋是為了**釐清關鍵資訊或消除歧義**，而非干擾閱讀。
     - **禁止過度註釋**：**絕不**為常見人名（如 John, Maria）、地名（如 New York, Tokyo）、組織名（如 Google, Toyota）等普遍知曉的專有名詞加上註釋。
     - **精準使用情境**：只在以下情況考慮使用（原文）或（中文釋義）註釋：
-        - **專業術語或技術縮寫** (例如：API, a
-          RESTful API)
+        - **專業術語或技術縮寫** (例如：API, a RESTful API)
         - **非通用或可能混淆的特定名稱** (例如：一個小型、不知名的公司或產品)
         - **詞語在該上下文有多重含義，需要澄清**
 
@@ -705,18 +695,20 @@ This mode is for ANY source that is NOT Modern Standard Chinese (Mandarin), incl
     - 除非 \`[聽不清]\` 嚴重破壞關鍵資訊（如 \`序號是 73[聽不清]9\`），否則不要將其帶入「翻譯」行。
 
 5.  **其他**：
-    - 絕不使用 \`【?…?】\`\`—\`或 \`——\` 標記。若詞義不清，請在「備註」中說明。
+    - 絕不使用 \`【?…?】\`\`—\`或 \`——\` 標記。若詞義不清，請在「註釋」中說明。
     - 嚴禁使用破折號
 
 === INPUT ===
-你將在單一 <source>…</source> 區塊內收到全文。只打印一次標頭，然後嚴格遵循上述格式與原則，產出專業、乾淨的逐字稿。
+你將在單一 <source>…</source> 區塊內收到文本。嚴格遵循上述 3-Part 格式與原則產出內容。
 `;
 }
 
 // ---------- GPT call using Responses API + SDK Chat fallback ----------
-async function gptTranslateFaithful(originalAll, requestId, mode = 'A', includeHeader = true) {
-  const systemPrompt = buildSystemPrompt(mode, includeHeader);
-  const preferred = process.env.TRANSLATION_MODEL || "gpt-5-mini";
+async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
+  const systemPrompt = buildSystemPrompt(mode);
+  
+  // Default to the flagship model if the Render variable isn't set
+  const preferred = process.env.TRANSLATION_MODEL || "gpt-5.2";
 
   try {
     const resp = await openai.responses.create({
@@ -744,8 +736,8 @@ async function gptTranslateFaithful(originalAll, requestId, mode = 'A', includeH
     await addStep(requestId, `Responses API failed (${preferred}): ${msg}; falling back.`);
   }
 
-  // SDK Chat fallback (no axios)
-  const chatCandidates = ["gpt-4.1-mini", "gpt-4o-mini"];
+  // SDK Chat fallback: Use the highly accurate GPT-5 lineup instead of mini models!
+  const chatCandidates = ["gpt-5.1", "gpt-5"];
   const messages = [
     { role: "system", content: systemPrompt },
     { role: "user",   content: `<source>\n${originalAll || ""}\n</source>` },
@@ -767,6 +759,28 @@ async function gptTranslateFaithful(originalAll, requestId, mode = 'A', includeH
   }
 
   return "【翻譯暫不可用：已附上原文】\n\n" + (originalAll || "");
+}
+
+// ---------- Output Parser ----------
+function parseChunk(text) {
+  const parts = { original: "", translation: "", lineByLine: "" };
+  if (!text) return parts;
+
+  // Extract the sections using regex based on the strict headers
+  const origMatch = text.match(/=== ORIGINAL ===\n([\s\S]*?)(?==== TRANSLATION ===|=== LINE-BY-LINE ===|$)/);
+  const transMatch = text.match(/=== TRANSLATION ===\n([\s\S]*?)(?==== LINE-BY-LINE ===|$)/);
+  const lineMatch = text.match(/=== LINE-BY-LINE ===\n([\s\S]*)$/);
+
+  if (origMatch) parts.original = origMatch[1].trim();
+  if (transMatch) parts.translation = transMatch[1].trim();
+  if (lineMatch) parts.lineByLine = lineMatch[1].trim();
+
+  // Fallback: if AI failed to output headers entirely, dump everything to Part 3
+  if (!origMatch && !transMatch && !lineMatch) {
+    parts.lineByLine = text.trim();
+  }
+
+  return parts;
 }
 
 // ---------- sanitizer to enforce your rules ----------
@@ -815,7 +829,8 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
     );
 
     let parts = [];
-    const tmpBase = `/tmp/${requestId}`;
+    const tmpBase = `/tmp/voixl/${requestId}`;
+    
     if (!needsSplit) {
       const singleOut = `${tmpBase}.${kbps}k.mp3`;
       tempFiles.add(singleOut);
@@ -893,7 +908,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
     });
     const results = await runBounded(tasks, concurrency);
 
-    // Stitch segments chronologically (Gemini suggestion)
+    // Stitch segments chronologically
     let allSegments = [];
     let offset = 0;
     for (let i = 0; i < results.length; i++) {
@@ -913,83 +928,122 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
     }
     allSegments.sort((a, b) => a.start - b.start);
 
-    // Group consecutive segments by inferred script/language
+    // Group consecutive segments by inferred script/language AND limit size
     const blocks = [];
+    const MAX_CHARS_PER_BLOCK = 2000; 
+
     for (const seg of allSegments) {
       const kind = guessLangFromText(seg.text);
       const last = blocks[blocks.length - 1];
-      if (last && last.kind === kind) {
+      
+      if (last && last.kind === kind && last.text.length < MAX_CHARS_PER_BLOCK) {
         last.text += (last.text ? " " : "") + seg.text;
       } else {
         blocks.push({ kind, text: seg.text });
       }
     }
 
-    // Build ORIGINAL text (raw, chronological)
     const originalAll = allSegments.map(s => s.text).join("\n\n");
 
-    // Decide per-block Mode and translate
-    let zhTraditional = "";
+    let finalPart1 = "";
+    let finalPart2 = "";
+    let finalPart3 = "";
+
     if (blocks.length === 0) {
-      // fallback: behave like before
+      // fallback
       const topDecision = decideChinese([language || ""], originalAll);
       const mode = (forceMode === 'A' || forceMode === 'B')
         ? forceMode
         : (topDecision.isChinese ? 'B' : 'A');
       addStep(requestId, `Mode decision (fallback): ${mode}`);
-      const translated = await gptTranslateFaithful(originalAll, requestId, mode, true);
-      zhTraditional = sanitizeForDelivery(translated);
+      const out = await gptTranslateFaithful(originalAll, requestId, mode);
+      const parsed = parseChunk(sanitizeForDelivery(out));
+      
+      finalPart1 = parsed.original;
+      finalPart2 = parsed.translation;
+      finalPart3 = parsed.lineByLine;
     } else {
-      addStep(requestId, `Blocks: ${blocks.length} (script-informed)`);
-      const pieces = [];
+      addStep(requestId, `Blocks: ${blocks.length} (script-informed & chunked)`);
       for (let i = 0; i < blocks.length; i++) {
         const b = blocks[i];
-        // Decide mode for this block
         let mode = 'A';
         if (b.kind === 'zh') {
           mode = looksDialectChinese(b.text) ? 'A' : 'B';
         } else {
           mode = 'A';
         }
-        const includeHeader = (i === 0); // only first block prints header
-        addStep(requestId, `Block ${i + 1}/${blocks.length}: kind=${b.kind}, mode=${mode}, chars=${b.text.length}`);
-        const out = await gptTranslateFaithful(b.text, requestId, mode, includeHeader);
-        pieces.push(sanitizeForDelivery(out));
+        addStep(requestId, `Block ${i + 1}/${blocks.length}: mode=${mode}, chars=${b.text.length}`);
+        
+        const out = await gptTranslateFaithful(b.text, requestId, mode);
+        const parsed = parseChunk(sanitizeForDelivery(out));
+
+        finalPart1 += parsed.original + "\n\n";
+        finalPart2 += parsed.translation + "\n\n";
+        finalPart3 += parsed.lineByLine + "\n\n";
       }
-      zhTraditional = pieces.join("\n\n");
     }
 
-    // email with attachments (Fix 5)
-    const localStamp = fmtLocalStamp(new Date());
-    const emailSubject = (blocks.some(b => b.kind === 'zh') && !blocks.some(b => b.kind !== 'zh'))
-      ? '您的中文逐字稿（原文＋備註）'
-      : '您的逐字稿（原文＋繁體中文翻譯）';
-    const headerZh = (blocks.some(b => b.kind === 'zh') && !blocks.some(b => b.kind !== 'zh'))
-      ? '＝＝ 中文逐字稿（繁體） ＝＝'
-      : '＝＝ 中文（繁體） ＝＝';
-    const attachmentText = `${headerZh}
-${zhTraditional}
+    // Clean up trailing newlines
+    finalPart1 = finalPart1.trim();
+    finalPart2 = finalPart2.trim();
+    finalPart3 = finalPart3.trim();
 
-＝＝ 原文 ＝＝
-${originalAll}
+    // Assemble the final attachment (Disclaimer is safely injected here!)
+    const disclaimer = `免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。請務必自行複核與修訂。本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。\n說明：括號（）與方括號[] 內的內容為系統為協助理解、整理與釐清而加入，非原文內容。`;
+
+    const attachmentText = `${disclaimer}
+
+//// 以下是您的逐字稿 //// 客服聯係 HELP@VOIXL.COM
+ ///// 感謝您的訂購與支持 /////
+
+========================================
+Part 1, Original Language Transcribe
+========================================
+${finalPart1}
+
+========================================
+Part 2, Traditional Chinese Translation
+========================================
+${finalPart2}
+
+========================================
+Part 3, Line by Line translation
+========================================
+${finalPart3}
 `;
-    const safeBase =
-      (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
+
+    const localStamp = fmtLocalStamp(new Date());
+    const emailSubject = '您的逐字稿已完成（完整三部分版）';
+    
+    const safeBase = (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
     const txtName = `${safeBase}-${requestId}.txt`;
     const docxName = `${safeBase}-${requestId}.docx`;
+    
+    // Generate DOCX with the 3 parts
     const doc = new Document({
       sections: [
         {
           children: [
-            new Paragraph(headerZh),
-            ...String(zhTraditional || "")
-              .split("\n")
-              .map((line) => new Paragraph(line)),
+            new Paragraph(disclaimer.split('\n')[0]),
+            new Paragraph(disclaimer.split('\n')[1]),
             new Paragraph(""),
-            new Paragraph("＝＝ 原文 ＝＝"),
-            ...String(originalAll || "")
-              .split("\n")
-              .map((line) => new Paragraph(line)),
+            new Paragraph("//// 以下是您的逐字稿 //// 客服聯係 HELP@VOIXL.COM"),
+            new Paragraph(" ///// 感謝您的訂購與支持 /////"),
+            new Paragraph(""),
+            new Paragraph("========================================"),
+            new Paragraph("Part 1, Original Language Transcribe"),
+            new Paragraph("========================================"),
+            ...finalPart1.split("\n").map((line) => new Paragraph(line)),
+            new Paragraph(""),
+            new Paragraph("========================================"),
+            new Paragraph("Part 2, Traditional Chinese Translation"),
+            new Paragraph("========================================"),
+            ...finalPart2.split("\n").map((line) => new Paragraph(line)),
+            new Paragraph(""),
+            new Paragraph("========================================"),
+            new Paragraph("Part 3, Line by Line translation"),
+            new Paragraph("========================================"),
+            ...finalPart3.split("\n").map((line) => new Paragraph(line)),
           ],
         },
       ],
@@ -1111,6 +1165,30 @@ ${originalAll}
   }
 }
 
+// === THE WAITING ROOM (QUEUE) ===
+const uploadQueue = []; 
+let isProcessingQueue = false; 
+
+async function processQueue() {
+  if (isProcessingQueue) return; 
+  isProcessingQueue = true; 
+
+  while (uploadQueue.length > 0) {
+    const jobData = uploadQueue.shift(); 
+    try {
+      await processJob(jobData);
+    } catch (e) {
+      console.error(`[${jobData.requestId}] Background crash:`, e?.message || e);
+      try {
+        await setJobStatus(jobData.requestId, "error", e?.message || String(e));
+        await updateStatus(jobData.requestId, "processing_fail");
+      } catch {}
+    }
+  }
+  isProcessingQueue = false; 
+}
+// ================================
+
 // ---------- routes (ACK-first upload) ----------
 app.post(
   "/upload",
@@ -1139,42 +1217,29 @@ app.post(
     const requestId =
       (req.body?.request_id || "").toString().trim() || crypto.randomUUID();
 
-    // Respond first so frontend doesn't see DB blips
     res.status(202).json({ success: true, accepted: true, requestId });
 
-    setImmediate(async () => {
-      try {
-        try {
-          await createJob(requestId);
-        } catch (dbErr) {
-          console.error(
-            `[${requestId}] createJob DB error (continuing):`,
-            dbErr?.message || dbErr
-          );
-        }
+    try {
+      await createJob(requestId);
+    } catch (dbErr) {
+      console.error(`[${requestId}] createJob DB error:`, dbErr?.message || dbErr);
+    }
 
-        // Fix 3: read QA overrides
-        const force_lang = (req.body?.force_lang || '').toString().trim();
-        const force_mode = (req.body?.force_mode || '').toString().trim().toUpperCase();
+    const force_lang = (req.body?.force_lang || '').toString().trim();
+    const force_mode = (req.body?.force_mode || '').toString().trim().toUpperCase();
 
-        await processJob({
-          email,
-          inputPath: req.file.path,
-          fileMeta: req.file,
-          requestId,
-          jobId: String(req.body?.job_id || ""),
-          token: String(req.body?.token || ""),
-          forceLang: force_lang || '',
-          forceMode: (force_mode === 'A' || force_mode === 'B') ? force_mode : ''
-        });
-      } catch (e) {
-        console.error(`[${requestId}] Background crash:`, e?.message || e);
-        try {
-          await setJobStatus(requestId, "error", e?.message || String(e));
-          await updateStatus(requestId, "processing_fail");
-        } catch {}
-      }
+    uploadQueue.push({
+      email,
+      inputPath: req.file.path,
+      fileMeta: req.file,
+      requestId,
+      jobId: String(req.body?.job_id || ""),
+      token: String(req.body?.token || ""),
+      forceLang: force_lang || '',
+      forceMode: (force_mode === 'A' || force_mode === 'B') ? force_mode : ''
     });
+
+    processQueue();
   }
 );
 
@@ -1227,9 +1292,37 @@ app.get("/", (_req, res) =>
   res.send("✅ Whisper backend (upload-only, Postgres) running")
 );
 
+// === THE AUTOMATED JANITOR ===
+setInterval(() => {
+  const janitorCloset = "/tmp/voixl";
+  
+  fs.readdir(janitorCloset, (err, files) => {
+    if (err) return; 
+
+    const rightNow = Date.now();
+    const twentyFourHours = 24 * 60 * 60 * 1000; 
+
+    files.forEach((file) => {
+      const filePath = path.join(janitorCloset, file);
+      
+      fs.stat(filePath, (err, stats) => {
+        if (err) return;
+
+        if (rightNow - stats.mtimeMs > twentyFourHours) {
+          fs.unlink(filePath, () => {
+            console.log(`🧹 Janitor deleted old file: ${file}`);
+          });
+        }
+      });
+    });
+  });
+}, 3600000); 
+// =============================
+
 const port = process.env.PORT || 3000;
-// <<< FIX: capture server and relax default Node timeouts
 const server = app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
-server.requestTimeout = 0;        // no overall per-request timeout
-server.headersTimeout = 0;        // allow slow clients to send headers
-server.keepAliveTimeout = 60_000;
+
+const FORTY_FIVE_MINUTES = 45 * 60 * 1000; 
+server.requestTimeout = FORTY_FIVE_MINUTES; 
+server.headersTimeout = 60000; 
+server.keepAliveTimeout = 60000;
