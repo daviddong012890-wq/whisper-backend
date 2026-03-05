@@ -708,8 +708,8 @@ async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
         { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
         { role: "user", content: [{ type: "input_text", text: `<source>\n${originalAll || ""}\n</source>` }] },
       ],
-      // Forcing maximum tokens to prevent the AI from running out of breath
-      max_tokens: 4096 
+      // FIX: Use the updated parameter name for newer models
+      max_completion_tokens: 4096 
     });
 
     const out =
@@ -738,7 +738,8 @@ async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
   for (const model of chatCandidates) {
     try {
       const r = await openai.chat.completions.create({
-        model, temperature: 0, messages, max_tokens: 4096
+        // FIX: Use the updated parameter name here as well
+        model, temperature: 0, messages, max_completion_tokens: 4096
       });
       const out = r.choices?.[0]?.message?.content?.trim();
       if (out) {
