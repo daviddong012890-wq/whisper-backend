@@ -297,7 +297,7 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ---------- language helpers (Fix 1) ----------
+// ---------- language helpers ----------
 function isChineseLang(code) {
   const c = (code || '').toLowerCase().trim();
   const sinitic = [
@@ -588,7 +588,7 @@ async function runBounded(tasks, limit = 3) {
   });
 }
 
-// ---------- GPT formatting prompts (Smart 3-Part / 1-Part System) ----------
+// ---------- GPT formatting prompts (2-Part System) ----------
 function buildSystemPrompt(mode) {
   if (mode === 'B') {
     return `
@@ -596,11 +596,14 @@ You are an expert Chinese-language editor and transcription specialist operating
 Your purpose is to take a raw Mandarin Chinese ASR transcript and transform it into a clean, accurate, and professionally polished document.
 This mode is ONLY for Modern Standard Chinese (Mandarin). For any other language or Chinese dialect, you must refuse to use this mode.
 
-=== 格式（單一部分輸出）===
-Because the original text is already in Mandarin, do NOT output 3 parts. You must output exactly ONE section with this exact header:
+=== 格式（必須分為兩個部分輸出）===
+You must output exactly these two sections with these exact headers:
 
-=== OPTIMIZED CHINESE ===
-[此處放置經過「優化轉寫」與「標點符號修飾」後的完整繁體中文逐字稿原文，並分為易讀的段落。若根據下方原則判斷需要新增註釋，請直接在對應的句子後方使用括號加上 (註釋: ...)。不要加上任何其他前綴或後綴。]
+=== ORIGINAL ===
+[此處直接放置 ASR 輸出轉寫成的**繁體中文**逐字稿原文，分為易讀的段落。保留原本的語氣。不要加上任何前綴。]
+
+=== TRANSLATION ===
+[此處放置經過「優化轉寫」與「標點符號修飾」後的完整繁體中文逐字稿，並分為易讀的段落。若根據下方原則判斷需要新增註釋，請直接在對應的句子後方使用括號加上 (註釋: ...)。]
 
 === 指導原則 (Guiding Principles) ===
 
@@ -609,7 +612,7 @@ Because the original text is already in Mandarin, do NOT output 3 parts. You mus
     * **保留原貌**：保留口吃、重複詞、以及原文中已存在的 \`[雜音]\`、\`[重疊]\` 等標記。不要人為新增此類標記。
 
 2.  **優化轉寫 (Optimized Transcription)**
-    * **繁體轉換**：若 ASR 輸出為簡體字，僅做字形轉換為繁體中文，不更改地區用詞（例如，「视频」轉為「視頻」，而非「影片」）。
+    * **繁體轉換**：若 ASR 輸出為簡體字，僅做字形轉換為繁體中文，不更改地區用詞（例如，「视频」轉為「视频」，而非「影片」）。
     * **標點符號**：根據語氣和停頓，使用正確、全形的中文標點符號，如「，」「。」「？」。
     * **外語處理**：如遇外語詞，可直接保留原文，並在詞後以括號加上**中文釋義**，例如 \`เราต้องไป check-in（辦理登記）\`。括號內不得出現外語。
 
@@ -627,32 +630,24 @@ Because the original text is already in Mandarin, do NOT output 3 parts. You mus
     * 嚴禁使用破折號 (\`—\` 或 \`——\`)。
 
 === INPUT ===
-你將在單一 <source>…</source> 區塊內收到文本。嚴格遵循上述「單一部分」格式與原則產出內容。
+你將在單一 <source>…</source> 區塊內收到文本。嚴格遵循上述 2-Part 格式與原則產出內容。
 `;
   }
 
-  // Mode A (Remains strictly 3 parts)
+  // Mode A
   return `
 You are an expert transcription and translation assistant operating in Mode A.
 Your primary goal is to produce a clean, accurate, and highly readable translation.
 This mode is for ANY source that is NOT Modern Standard Chinese (Mandarin), including all foreign languages and Chinese dialects.
 
-=== FORMAT（必須分為三個部分輸出）===
-You must output exactly these three sections with these exact headers:
+=== FORMAT（必須分為兩個部分輸出）===
+You must output exactly these two sections with these exact headers:
 
 === ORIGINAL ===
 [直接放置逐字輸出 ASR 的完整原文段落（不要再包任何括號或符號；保留口吃、贅詞；若原句自帶噪音標記如 [雜音]、[重疊]，原樣保留）。分為易讀的段落。]
 
 === TRANSLATION ===
-[將原文以繁體中文進行**通順且忠實的翻譯**。翻譯應自然流暢，易於閱讀，並分為易讀的段落。]
-
-=== LINE-BY-LINE ===
-[逐句提供對照]
-(原文)
-(翻譯)
-(註釋: [僅在符合下方「括號使用原則」時提供簡短補充。])
-
-（空一行後，處理下一句）
+[將原文以繁體中文進行**通順且忠實的翻譯**。翻譯應自然流暢，易於閱讀，並分為易讀的段落。若根據下方「括號使用原則」需要新增註釋，請直接在對應的翻譯句子後方使用括號加上 (註釋: ...)。]
 
 === CORE RULES ===
 
@@ -671,15 +666,15 @@ You must output exactly these three sections with these exact headers:
         - **詞語在該上下文有多重含義，需要澄清**
 
 4.  **標記處理**：
-    - \`[雜音]\`, \`[重疊]\` 等標記僅保留在「原文行」。
-    - 除非 \`[聽不清]\` 嚴重破壞關鍵資訊（如 \`序號是 73[聽不清]9\`），否則不要將其帶入「翻譯」行。
+    - \`[雜音]\`, \`[重疊]\` 等標記僅保留在「原文」部分。
+    - 除非 \`[聽不清]\` 嚴重破壞關鍵資訊（如 \`序號是 73[聽不清]9\`），否則不要將其帶入「翻譯」部分。
 
 5.  **其他**：
     - 絕不使用 \`【?…?】\`\`—\`或 \`——\` 標記。若詞義不清，請在「註釋」中說明。
     - 嚴禁使用破折號
 
 === INPUT ===
-你將在單一 <source>…</source> 區塊內收到文本。嚴格遵循上述 3-Part 格式與原則產出內容。
+你將在單一 <source>…</source> 區塊內收到文本。嚴格遵循上述 2-Part 格式與原則產出內容。
 `;
 }
 
@@ -697,7 +692,7 @@ async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
         { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
         { role: "user", content: [{ type: "input_text", text: `<source>\n${originalAll || ""}\n</source>` }] },
       ],
-      // FIX 1: The Responses API requires exactly "max_output_tokens"
+      // FIX: The Responses API requires exactly "max_output_tokens"
       max_output_tokens: 4096 
     });
 
@@ -727,7 +722,7 @@ async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
   for (const model of chatCandidates) {
     try {
       const r = await openai.chat.completions.create({
-        // FIX 2: The Chat Completions API requires exactly "max_completion_tokens"
+        // FIX: The Chat Completions API requires exactly "max_completion_tokens"
         model, temperature: 0, messages, max_completion_tokens: 4096
       });
       const out = r.choices?.[0]?.message?.content?.trim();
@@ -746,32 +741,21 @@ async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
 
 // ---------- Output Parser ----------
 function parseChunk(text) {
-  const parts = { original: "", translation: "", lineByLine: "", optimized: "" };
+  const parts = { original: "", translation: "" };
   if (!text) return parts;
 
-  // Detect Mode B's single optimized Chinese section
-  const optRegex = /===+\s*\*?OPTIMIZED CHINESE\*?\s*===+([\s\S]*)$/i;
-  const optMatch = text.match(optRegex);
-  if (optMatch && optMatch[1]) {
-    parts.optimized = optMatch[1].trim();
-    return parts; // Fast exit if it's pure Chinese
-  }
-
-  // Detect Mode A's 3-part sections
-  const origRegex = /===+\s*\*?ORIGINAL\*?\s*===+([\s\S]*?)(?====+\s*\*?TRANSLATION|===+\s*\*?LINE-BY-LINE|$)/i;
-  const transRegex = /===+\s*\*?TRANSLATION\*?\s*===+([\s\S]*?)(?====+\s*\*?LINE-BY-LINE|$)/i;
-  const lineRegex = /===+\s*\*?LINE-BY-LINE\*?\s*===+([\s\S]*)$/i;
+  // Extract exactly two sections using regex based on the headers
+  const origRegex = /===+\s*\*?ORIGINAL\*?\s*===+([\s\S]*?)(?====+\s*\*?TRANSLATION|$)/i;
+  const transRegex = /===+\s*\*?TRANSLATION\*?\s*===+([\s\S]*)$/i;
 
   const origMatch = text.match(origRegex);
   const transMatch = text.match(transRegex);
-  const lineMatch = text.match(lineRegex);
 
   if (origMatch && origMatch[1]) parts.original = origMatch[1].trim();
   if (transMatch && transMatch[1]) parts.translation = transMatch[1].trim();
-  if (lineMatch && lineMatch[1]) parts.lineByLine = lineMatch[1].trim();
 
-  // Fallback: If AI rebelled, don't lose the text.
-  if (!parts.original && !parts.translation && !parts.lineByLine) {
+  // Fallback: If the AI completely rebelled and ignored headers, don't lose the text.
+  if (!parts.original && !parts.translation) {
     parts.original = text.trim();
   }
 
@@ -877,8 +861,8 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
     try {
       const { rows } = await pool.query(
         `SELECT COALESCE(SUM(jobseconds), 0)::int AS total
-            FROM transcriptions
-           WHERE email = $1 AND succeeded = true`,
+           FROM transcriptions
+          WHERE email = $1 AND succeeded = true`,
         [email]
       );
       pastSeconds = Number(rows?.[0]?.total || 0);
@@ -925,7 +909,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
 
     // Group consecutive segments by inferred script/language AND limit size
     const blocks = [];
-    const MAX_CHARS_PER_BLOCK = 1000; // REDUCED heavily to prevent AI Token cut-offs
+    const MAX_CHARS_PER_BLOCK = 1000; 
 
     for (const seg of allSegments) {
       const kind = guessLangFromText(seg.text);
@@ -940,13 +924,8 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
 
     const originalAll = allSegments.map(s => s.text).join("\n\n");
 
-    // --- START REPLACEMENT AREA ---
     let finalPart1 = "";
     let finalPart2 = "";
-    let finalPart3 = "";
-    let finalOptimized = "";
-    let hasModeA = false;
-    let hasModeB = false;
 
     if (blocks.length === 0) {
       // fallback
@@ -958,15 +937,8 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
       const out = await gptTranslateFaithful(originalAll, requestId, mode);
       const parsed = parseChunk(sanitizeForDelivery(out));
       
-      if (mode === 'B') {
-        hasModeB = true;
-        finalOptimized = parsed.optimized || parsed.original || "";
-      } else {
-        hasModeA = true;
-        finalPart1 = parsed.original || "";
-        finalPart2 = parsed.translation || "";
-        finalPart3 = parsed.lineByLine || "";
-      }
+      finalPart1 = parsed.original;
+      finalPart2 = parsed.translation;
     } else {
       addStep(requestId, `Blocks: ${blocks.length} (script-informed & chunked)`);
       for (let i = 0; i < blocks.length; i++) {
@@ -982,84 +954,66 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
         const out = await gptTranslateFaithful(b.text, requestId, mode);
         const parsed = parseChunk(sanitizeForDelivery(out));
 
-        if (mode === 'A') {
-          hasModeA = true;
-          finalPart1 += (parsed.original ? parsed.original + "\n\n" : "");
-          finalPart2 += (parsed.translation ? parsed.translation + "\n\n" : "");
-          finalPart3 += (parsed.lineByLine ? parsed.lineByLine + "\n\n" : "");
-        } else {
-          hasModeB = true;
-          const optText = parsed.optimized || parsed.original || "";
-          finalOptimized += optText + "\n\n";
-          // If mixed with foreign languages, safely map Chinese to the 3 parts so layout doesn't break
-          finalPart1 += optText + "\n\n";
-          finalPart2 += optText + "\n\n";
-          finalPart3 += optText + "\n\n";
-        }
+        finalPart1 += (parsed.original ? parsed.original + "\n\n" : "");
+        finalPart2 += (parsed.translation ? parsed.translation + "\n\n" : "");
       }
     }
 
     // Clean up trailing newlines
     finalPart1 = finalPart1.trim();
     finalPart2 = finalPart2.trim();
-    finalPart3 = finalPart3.trim();
-    finalOptimized = finalOptimized.trim();
 
-    // Assemble the final attachment based on what was used
+    // Assemble the final attachment (Disclaimer is safely injected here!)
     const disclaimer = `免責聲明：本翻譯／轉寫由自動系統產生，可能因口音、方言、背景雜音、語速、重疊語音、錄音品質或上下文不足等因素而不完全準確。請務必自行複核與修訂。本服務對因翻譯或轉寫錯誤所致之任何損失、損害或責任，概不負擔。\n說明：括號（）與方括號[] 內的內容為系統為協助理解、整理與釐清而加入，非原文內容。`;
-    
-    let attachmentText = `${disclaimer}\n\n//// 以下是您的逐字稿 //// 客服聯係 HELP@VOIXL.COM\n ///// 感謝您的訂購與支持 /////\n\n`;
-    
-    let docSections = [
-        new Paragraph(disclaimer.split('\n')[0]),
-        new Paragraph(disclaimer.split('\n')[1]),
-        new Paragraph(""),
-        new Paragraph("//// 以下是您的逐字稿 //// 客服聯係 HELP@VOIXL.COM"),
-        new Paragraph(" ///// 感謝您的訂購與支持 /////"),
-        new Paragraph(""),
-    ];
 
-    if (hasModeB && !hasModeA) {
-      // 🟢 SCENARIO 1: Pure Chinese Video - Output clean single-part layout
-      attachmentText += `========================================\n中文逐字稿（已優化）\n========================================\n${finalOptimized}`;
-      docSections.push(
-        new Paragraph("========================================"),
-        new Paragraph("中文逐字稿（已優化）"),
-        new Paragraph("========================================"),
-        ...finalOptimized.split("\n").map((line) => new Paragraph(line))
-      );
-    } else {
-      // 🔵 SCENARIO 2: Foreign or Mixed Video - Output 3-part layout
-      attachmentText += `========================================\nPart 1, Original Language Transcribe\n========================================\n${finalPart1}\n\n========================================\nPart 2, Traditional Chinese Translation\n========================================\n${finalPart2}\n\n========================================\nPart 3, Line by Line translation\n========================================\n${finalPart3}`;
-      
-      docSections.push(
-        new Paragraph("========================================"),
-        new Paragraph("Part 1, Original Language Transcribe"),
-        new Paragraph("========================================"),
-        ...finalPart1.split("\n").map((line) => new Paragraph(line)),
-        new Paragraph(""),
-        new Paragraph("========================================"),
-        new Paragraph("Part 2, Traditional Chinese Translation"),
-        new Paragraph("========================================"),
-        ...finalPart2.split("\n").map((line) => new Paragraph(line)),
-        new Paragraph(""),
-        new Paragraph("========================================"),
-        new Paragraph("Part 3, Line by Line translation"),
-        new Paragraph("========================================"),
-        ...finalPart3.split("\n").map((line) => new Paragraph(line))
-      );
-    }
+    const attachmentText = `${disclaimer}
+
+//// 以下是您的逐字稿 //// 客服聯係 HELP@VOIXL.COM
+ ///// 感謝您的訂購與支持 /////
+
+========================================
+Part 1, Original Language Transcribe
+========================================
+${finalPart1}
+
+========================================
+Part 2, Traditional Chinese Translation
+========================================
+${finalPart2}
+`;
 
     const localStamp = fmtLocalStamp(new Date());
-    const emailSubject = (hasModeB && !hasModeA) ? '您的逐字稿已完成（已優化）' : '您的逐字稿已完成（完整三部分版）';
+    const emailSubject = '您的逐字稿已完成（雙語對照版）';
     
     const safeBase = (fileName || "transcript").replace(/[^\w.-]+/g, "_").slice(0, 50) || "transcript";
     const txtName = `${safeBase}-${requestId}.txt`;
     const docxName = `${safeBase}-${requestId}.docx`;
     
-    const doc = new Document({ sections: [{ children: docSections }] });
+    // Generate DOCX with the 2 parts
+    const doc = new Document({
+      sections: [
+        {
+          children: [
+            new Paragraph(disclaimer.split('\n')[0]),
+            new Paragraph(disclaimer.split('\n')[1]),
+            new Paragraph(""),
+            new Paragraph("//// 以下是您的逐字稿 //// 客服聯係 HELP@VOIXL.COM"),
+            new Paragraph(" ///// 感謝您的訂購與支持 /////"),
+            new Paragraph(""),
+            new Paragraph("========================================"),
+            new Paragraph("Part 1, Original Language Transcribe"),
+            new Paragraph("========================================"),
+            ...finalPart1.split("\n").map((line) => new Paragraph(line)),
+            new Paragraph(""),
+            new Paragraph("========================================"),
+            new Paragraph("Part 2, Traditional Chinese Translation"),
+            new Paragraph("========================================"),
+            ...finalPart2.split("\n").map((line) => new Paragraph(line)),
+          ],
+        },
+      ],
+    });
     const docxBuffer = await Packer.toBuffer(doc);
-    // --- END REPLACEMENT AREA ---
 
     addStep(requestId, "Sending email …");
     await mailer.sendMail({
