@@ -114,7 +114,7 @@ app.use(express.json({ limit: "1mb" }));
 
 // <<< FIX: Give uploads a maximum 45-minute limit instead of waiting forever
 app.use((req, _res, next) => {
-  const FORTY_FIVE_MINUTES = 45 * 60 * 1000; // 45 minutes in milliseconds
+  const FORTY_FIVE_MINUTES = 45 * 60 * 1000; 
   
   try { req.setTimeout?.(FORTY_FIVE_MINUTES); } catch {}
   try {
@@ -129,7 +129,7 @@ app.use((req, _res, next) => {
 // ===== Upload-only mode =====
 const MAX_UPLOAD_BYTES = Number(
   process.env.MAX_UPLOAD_BYTES || 1.5 * 1024 * 1024 * 1024
-); // 1.5 GB default
+); 
 
 // Create the dedicated folder if it doesn't exist yet
 if (!fs.existsSync("/tmp/voixl")) {
@@ -199,8 +199,6 @@ pool
 
 /** -------------------------------------------------------
  * Ensure required tables exist (auto-migrate on boot)
- * - jobs          (requestid, status, steps jsonb, error, created_at)
- * - transcriptions (columns your code writes to)
  * ------------------------------------------------------ */
 async function ensureSchema() {
   await pool.query(`
@@ -256,10 +254,10 @@ const mailer = nodemailer.createTransport({
 });
 
 // ---------- small utils ----------
-const OPENAI_AUDIO_MAX = 25 * 1024 * 1024; // OpenAI per-file limit (25 MB)
-const TARGET_MAX_BYTES = 24 * 1024 * 1024; // aim just under
-const MIN_SEG_SECONDS = 420; // 7 min
-const MAX_SEG_SECONDS = 600; // 10 min (cap tightened)
+const OPENAI_AUDIO_MAX = 25 * 1024 * 1024; 
+const TARGET_MAX_BYTES = 24 * 1024 * 1024; 
+const MIN_SEG_SECONDS = 420; 
+const MAX_SEG_SECONDS = 600; 
 const DEFAULT_SEG_SECONDS = 600;
 
 function statBytes(p) {
@@ -303,14 +301,14 @@ function sleep(ms) {
 function isChineseLang(code) {
   const c = (code || '').toLowerCase().trim();
   const sinitic = [
-    'zh', 'zh-cn', 'zh-tw', 'zh-hk', // Chinese
-    'cmn', 'yue', 'wuu', 'gan', 'hak', 'nan' // Mandarin, Cantonese, Wu, Gan, Hakka, Minnan
+    'zh', 'zh-cn', 'zh-tw', 'zh-hk', 
+    'cmn', 'yue', 'wuu', 'gan', 'hak', 'nan' 
   ];
   return sinitic.some(p => c === p || c.startsWith(p));
 }
 function cjkRatio(text) {
   if (!text) return 0;
-  const cjk = text.match(/[\u3400-\u4DBF\u4E00-\u9FFF]/g) || []; // CJK Ext-A + Unified
+  const cjk = text.match(/[\u3400-\u4DBF\u4E00-\u9FFF]/g) || []; 
   return cjk.length / text.length;
 }
 function decideChinese(langs, text) {
@@ -334,7 +332,6 @@ function decideChinese(langs, text) {
   return { isChinese: false, finalLang: topLang || '', reason: topLang ? `majority language "${topLang}"` : 'no language reported' };
 }
 
-// Extra heuristics for dialect-ish Chinese → prefer Mode A
 const DIALECT_MARKERS = [
   '唔','冇','咗','喺','嚟','嗰','嘅','啲','咁','佢哋','邊度',
   '侬','阿拉','伲','勿','伊拉','辰光','宁','沪','海派','老早',
@@ -346,7 +343,6 @@ function looksDialectChinese(text) {
   return DIALECT_MARKERS.some(w => t.includes(w));
 }
 
-// Script-based quick guess for per-segment grouping
 function guessLangFromText(t) {
   if (!t) return 'latin';
   const cjk = (t.match(/[\u4E00-\u9FFF]/g) || []).length;
@@ -359,14 +355,13 @@ function guessLangFromText(t) {
   return 'latin';
 }
 
-// ---------- keep-alive axios for OpenAI (reduces "socket hang up") ----------
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 
 const axiosOpenAI = axios.create({
   httpAgent,
   httpsAgent,
-  timeout: 900000, // 15 min
+  timeout: 900000, 
   maxContentLength: Infinity,
   maxBodyLength: Infinity,
   headers: {
@@ -432,7 +427,6 @@ app.get("/status", async (req, res) => {
   res.json({ ...j, steps });
 });
 
-// ---------- media analysis ----------
 function ffprobeDurationSeconds(filePath) {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, meta) => {
@@ -442,7 +436,6 @@ function ffprobeDurationSeconds(filePath) {
   });
 }
 
-// ---------- bitrate planning ----------
 function estimateSizeBytes(seconds, kbps) {
   return Math.ceil(seconds * (kbps * 1000) / 8);
 }
@@ -464,7 +457,6 @@ function computeSegmentSeconds(kbps) {
   return Math.max(MIN_SEG_SECONDS, Math.min(MAX_SEG_SECONDS, seconds || DEFAULT_SEG_SECONDS));
 }
 
-// ---------- single-pass encode helpers ----------
 async function encodeSingleMp3(inPath, outMp3, kbps, requestId) {
   addStep(requestId, `Encode MP3 @ ${kbps} kbps (single file)…`);
   await new Promise((resolve, reject) => {
@@ -483,6 +475,7 @@ async function encodeSingleMp3(inPath, outMp3, kbps, requestId) {
   });
   return outMp3;
 }
+
 async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, requestId) {
   addStep(requestId, `Encode+Segment MP3 @ ${kbps} kbps, ~${segmentSeconds}s/part…`);
   await new Promise((resolve, reject) => {
@@ -512,16 +505,14 @@ async function encodeAndSegmentMp3(inPath, outPattern, kbps, segmentSeconds, req
   return files;
 }
 
-// ---------- OpenAI SDK client ----------
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   maxRetries: 5,
   timeout: 900_000, 
 });
 
-// ---------- Whisper via SDK (Fix 2) ----------
 async function openaiTranscribeVerbose(audioPath, requestId, langHint) {
-  const PER_CALL_MS = Number(process.env.WHISPER_CALL_TIMEOUT_MS || 360_000); // 6 minutes
+  const PER_CALL_MS = Number(process.env.WHISPER_CALL_TIMEOUT_MS || 360_000); 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PER_CALL_MS);
 
@@ -550,7 +541,6 @@ async function openaiTranscribeVerbose(audioPath, requestId, langHint) {
   }
 }
 
-// ---------- retries & bounded concurrency ----------
 function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
 async function withRetries(fn, { maxAttempts = 5, baseDelayMs = 700 } = {}) {
   let attempt = 0;
@@ -577,6 +567,7 @@ async function withRetries(fn, { maxAttempts = 5, baseDelayMs = 700 } = {}) {
     }
   }
 }
+
 async function runBounded(tasks, limit = 3) {
   const results = new Array(tasks.length);
   let next = 0, active = 0;
@@ -605,7 +596,7 @@ You are an expert Chinese-language editor and transcription specialist operating
 Your purpose is to take a raw Mandarin Chinese ASR transcript and transform it into a clean, accurate, and professionally polished document.
 This mode is ONLY for Modern Standard Chinese (Mandarin). For any other language or Chinese dialect, you must refuse to use this mode.
 
-=== 格式（分為三個部分輸出）===
+=== 格式（必須分為三個部分輸出）===
 You must output exactly these three sections with these exact headers:
 
 === ORIGINAL ===
@@ -657,7 +648,7 @@ You are an expert transcription and translation assistant operating in Mode A.
 Your primary goal is to produce a clean, accurate, and highly readable translation.
 This mode is for ANY source that is NOT Modern Standard Chinese (Mandarin), including all foreign languages and Chinese dialects.
 
-=== FORMAT（分為三個部分輸出）===
+=== FORMAT（必須分為三個部分輸出）===
 You must output exactly these three sections with these exact headers:
 
 === ORIGINAL ===
@@ -717,6 +708,8 @@ async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
         { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
         { role: "user", content: [{ type: "input_text", text: `<source>\n${originalAll || ""}\n</source>` }] },
       ],
+      // Forcing maximum tokens to prevent the AI from running out of breath
+      max_tokens: 4096 
     });
 
     const out =
@@ -745,7 +738,7 @@ async function gptTranslateFaithful(originalAll, requestId, mode = 'A') {
   for (const model of chatCandidates) {
     try {
       const r = await openai.chat.completions.create({
-        model, temperature: 0, messages
+        model, temperature: 0, messages, max_tokens: 4096
       });
       const out = r.choices?.[0]?.message?.content?.trim();
       if (out) {
@@ -766,18 +759,22 @@ function parseChunk(text) {
   const parts = { original: "", translation: "", lineByLine: "" };
   if (!text) return parts;
 
-  // Extract the sections using regex based on the strict headers
-  const origMatch = text.match(/=== ORIGINAL ===\n([\s\S]*?)(?==== TRANSLATION ===|=== LINE-BY-LINE ===|$)/);
-  const transMatch = text.match(/=== TRANSLATION ===\n([\s\S]*?)(?==== LINE-BY-LINE ===|$)/);
-  const lineMatch = text.match(/=== LINE-BY-LINE ===\n([\s\S]*)$/);
+  // Use highly flexible regex to catch headers even if the AI adds spaces, asterisks, or markdown
+  const origRegex = /===+\s*\*?ORIGINAL\*?\s*===+([\s\S]*?)(?====+\s*\*?TRANSLATION|===+\s*\*?LINE-BY-LINE|$)/i;
+  const transRegex = /===+\s*\*?TRANSLATION\*?\s*===+([\s\S]*?)(?====+\s*\*?LINE-BY-LINE|$)/i;
+  const lineRegex = /===+\s*\*?LINE-BY-LINE\*?\s*===+([\s\S]*)$/i;
 
-  if (origMatch) parts.original = origMatch[1].trim();
-  if (transMatch) parts.translation = transMatch[1].trim();
-  if (lineMatch) parts.lineByLine = lineMatch[1].trim();
+  const origMatch = text.match(origRegex);
+  const transMatch = text.match(transRegex);
+  const lineMatch = text.match(lineRegex);
 
-  // Fallback: if AI failed to output headers entirely, dump everything to Part 3
-  if (!origMatch && !transMatch && !lineMatch) {
-    parts.lineByLine = text.trim();
+  if (origMatch && origMatch[1]) parts.original = origMatch[1].trim();
+  if (transMatch && transMatch[1]) parts.translation = transMatch[1].trim();
+  if (lineMatch && lineMatch[1]) parts.lineByLine = lineMatch[1].trim();
+
+  // Fallback: If the AI completely rebelled and ignored headers, don't lose the text.
+  if (!parts.original && !parts.translation && !parts.lineByLine) {
+    parts.original = text.trim();
   }
 
   return parts;
@@ -930,7 +927,7 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
 
     // Group consecutive segments by inferred script/language AND limit size
     const blocks = [];
-    const MAX_CHARS_PER_BLOCK = 2000; 
+    const MAX_CHARS_PER_BLOCK = 1000; // REDUCED heavily to prevent AI Token cut-offs
 
     for (const seg of allSegments) {
       const kind = guessLangFromText(seg.text);
@@ -977,9 +974,9 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
         const out = await gptTranslateFaithful(b.text, requestId, mode);
         const parsed = parseChunk(sanitizeForDelivery(out));
 
-        finalPart1 += parsed.original + "\n\n";
-        finalPart2 += parsed.translation + "\n\n";
-        finalPart3 += parsed.lineByLine + "\n\n";
+        finalPart1 += (parsed.original ? parsed.original + "\n\n" : "");
+        finalPart2 += (parsed.translation ? parsed.translation + "\n\n" : "");
+        finalPart3 += (parsed.lineByLine ? parsed.lineByLine + "\n\n" : "");
       }
     }
 
