@@ -972,12 +972,12 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
  ///// 感謝您的訂購與支持 /////
 
 ========================================
-Part 1, Original Language Transcribe
+【第一部分：原文轉錄】Part 1, Original Language Transcribe
 ========================================
 ${finalPart1}
 
 ========================================
-Part 2, Traditional Chinese Translation
+【第二部分：繁體中文翻譯】Part 2, Traditional Chinese Translation
 ========================================
 ${finalPart2}
 `;
@@ -1001,12 +1001,12 @@ ${finalPart2}
             new Paragraph(" ///// 感謝您的訂購與支持 /////"),
             new Paragraph(""),
             new Paragraph("========================================"),
-            new Paragraph("Part 1, Original Language Transcribe"),
+            new Paragraph("【第一部分：原文轉錄】Part 1, Original Language Transcribe"),
             new Paragraph("========================================"),
             ...finalPart1.split("\n").map((line) => new Paragraph(line)),
             new Paragraph(""),
             new Paragraph("========================================"),
-            new Paragraph("Part 2, Traditional Chinese Translation"),
+            new Paragraph("【第二部分：繁體中文翻譯】Part 2, Traditional Chinese Translation"),
             new Paragraph("========================================"),
             ...finalPart2.split("\n").map((line) => new Paragraph(line)),
           ],
