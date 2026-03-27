@@ -325,6 +325,15 @@ function decideChinese(langs, text) {
   if (isChineseLang(topLang)) {
     return { isChinese: true, finalLang: topLang, reason: `majority language "${topLang}"` };
   }
+
+  // ---> UPDATED FIX: Check for uniquely Japanese OR Korean characters! <---
+  // \u3040-\u30FF = Japanese Kana
+  // \uAC00-\uD7AF = Korean Hangul
+  const hasJapaneseOrKorean = /[\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]/.test(text || '');
+  if (hasJapaneseOrKorean) {
+    return { isChinese: false, finalLang: 'ja/ko', reason: 'Contains Japanese or Korean script' };
+  }
+
   const ratio = cjkRatio(text);
   if (ratio > 0.20) {
     return { isChinese: true, finalLang: topLang || 'zh', reason: `CJK ratio ${(ratio*100).toFixed(1)}%` };
@@ -349,7 +358,7 @@ function guessLangFromText(t) {
   const hira = (t.match(/[\u3040-\u309F]/g) || []).length;
   const kata = (t.match(/[\u30A0-\u30FF]/g) || []).length;
   const hang = (t.match(/[\uAC00-\uD7AF]/g) || []).length;
-  if (hira + kata > Math.max(cjk, 0) && (hira + kata) >= 2) return 'ja';
+  if (hira + kata > Math.max(cjk, 0) && (hira + kata) >= 1) return 'ja';
   if (hang > Math.max(cjk, 0) && hang >= 2) return 'ko';
   if (cjk >= 2) return 'zh';
   return 'latin';
@@ -898,12 +907,23 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
     let finalPart1 = "";
     let finalPart2 = "";
 
-    if (blocks.length === 0) {
+if (blocks.length === 0) {
       // fallback
       const topDecision = decideChinese([language || ""], originalAll);
-      const mode = (forceMode === 'A' || forceMode === 'B')
-        ? forceMode
-        : (topDecision.isChinese ? 'B' : 'A');
+      
+      // NEW: Check if Whisper found a language, and if it's NOT Chinese
+      const isWhisperChinese = (language === 'zh' || language === 'chinese');
+      const whisperForcesModeA = language && !isWhisperChinese;
+      
+      let mode = 'A';
+      if (forceMode === 'A' || forceMode === 'B') {
+        mode = forceMode;
+      } else if (whisperForcesModeA) {
+        mode = 'A'; // Whisper knows it's NOT Chinese (e.g., Korean, Thai), force Mode A
+      } else {
+        mode = topDecision.isChinese ? 'B' : 'A';
+      }
+      
       addStep(requestId, `Mode decision (fallback): ${mode}`);
       
       // We already have the flawless original text!
@@ -912,14 +932,23 @@ async function processJob({ email, inputPath, fileMeta, requestId, jobId, token,
       finalPart2 = sanitizeForDelivery(out);
     } else {
       addStep(requestId, `Blocks: ${blocks.length} (script-informed & chunked)`);
+      
+      // NEW: Apply the same broad language check to the chunks
+      const isWhisperChinese = (language === 'zh' || language === 'chinese');
+      const whisperForcesModeA = language && !isWhisperChinese;
+
       for (let i = 0; i < blocks.length; i++) {
         const b = blocks[i];
+        
         let mode = 'A';
-        if (b.kind === 'zh') {
+        if (whisperForcesModeA) {
+          mode = 'A'; // It's foreign audio, ignore the text-block guessing!
+        } else if (b.kind === 'zh') {
           mode = looksDialectChinese(b.text) ? 'A' : 'B';
         } else {
           mode = 'A';
         }
+        
         addStep(requestId, `Block ${i + 1}/${blocks.length}: mode=${mode}, chars=${b.text.length}`);
         
         // 1. Append the flawless original text directly from Whisper
