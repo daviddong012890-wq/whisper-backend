@@ -1007,7 +1007,7 @@ ${finalPart2}
             ...finalPart1.split("\n").map((line) => new Paragraph(line)),
             new Paragraph(""),
             new Paragraph("========================================"),
-            new Paragraph("【第二部份：繁體中文翻譯】Part 2, Traditional Chinese Translation"),
+            new Paragraph("【第二部份：繁體中文翻譯/格式優化】Part 2, Traditional Chinese Translation"),
             new Paragraph("========================================"),
             ...finalPart2.split("\n").map((line) => new Paragraph(line)),
           ],
