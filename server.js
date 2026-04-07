@@ -978,7 +978,7 @@ if (blocks.length === 0) {
 ${finalPart1}
 
 ========================================
-【第二部份：繁體中文翻譯】Part 2, Traditional Chinese Translation
+【第二部份：繁體中文翻譯/格式優化】Part 2, Traditional Chinese Translation
 ========================================
 ${finalPart2}
 `;
