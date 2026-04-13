@@ -140,9 +140,18 @@ const upload = multer({
   dest: "/tmp/voixl",
   limits: { fileSize: MAX_UPLOAD_BYTES },
   fileFilter: (_req, file, cb) => {
-    const ok =
-      (file.mimetype || "").startsWith("audio/") ||
-      (file.mimetype || "").startsWith("video/");
+    const mime = (file.mimetype || "").toLowerCase();
+    let ok = mime.startsWith("audio/") || mime.startsWith("video/");
+    
+    // The Forgiveness Check: If the MIME type is messy, check the file extension
+    if (!ok) {
+      const extName = path.extname(file.originalname || "").toLowerCase();
+      const validExts = ['.mp3','.mp4','.mpeg','.mpga','.m4a','.wav','.webm','.ogg','.flac','.aac','.amr','.aiff','.wma','.mov','.mkv','.avi'];
+      if (validExts.includes(extName)) {
+        ok = true;
+      }
+    }
+    
     if (!ok) return cb(new Error("Only audio/video files are allowed."));
     cb(null, true);
   },
